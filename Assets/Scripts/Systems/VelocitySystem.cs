@@ -1,9 +1,12 @@
+#define DISABLE_VELOCITY_SYSTEM
+#if !DISABLE_VELOCITY_SYSTEM
 using Unity.Entities;
 using Unity.Physics;
 using Unity.Physics.Systems;
 using Unity.Mathematics;
 using Unity.Jobs;
 using Unity.Burst;
+
 
 // Run after Physics has done time integration
 // This means the SPH calculations are always 1 timestep ahead the velocity
@@ -13,13 +16,12 @@ using Unity.Burst;
 [UpdateAfter(typeof(ExportPhysicsWorld))]
 public class VelocitySystem : SystemBase
 {
-    JobHandle last_frame;
     protected override void OnUpdate()
     {
         // Need to get dt for velocity updates
         var dt = World.Time.DeltaTime;
-        
-        Entities.ForEach((int entityInQueryIndex, Entity i, 
+
+        Entities.ForEach((int entityInQueryIndex, Entity i,
             ref PhysicsVelocity vel, in ParticleDensity density_i, in ParticlePressureGrad pressureGrad_i, in GravityField gravity_i) =>
         {
             // First need to EOM ourselves from Pressure, density, gravity, inertia to dv/dt
@@ -34,3 +36,4 @@ public class VelocitySystem : SystemBase
         }).ScheduleParallel();
     }
 }
+#endif

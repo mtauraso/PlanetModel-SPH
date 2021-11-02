@@ -60,11 +60,10 @@ public struct KernelContribution
 [UpdateAfter(typeof(BuildPhysicsWorld))]
 [UpdateBefore(typeof(StepPhysicsWorld))]
 public class KernelSystem : SystemBase, IParticleSystem
-
 {
     private BuildPhysicsWorld m_BuildPhysicsWorld;
     private StepPhysicsWorld m_StepPhysicsWorld;
-
+#if !KERNEL_DYNAMIC_BUFFER
     // These arrays are allocated and updated each frame.
     // If you want to use them in a system you need to:
     //
@@ -100,6 +99,7 @@ public class KernelSystem : SystemBase, IParticleSystem
 #else
     public static NativeHashMap<EntityOrderedPair, float4> kernelContributions;
 #endif
+#endif
 
     public JobHandle GetOutputDependency() => outputDependency;
     private JobHandle outputDependency; // Only valid after StepPhysics runs
@@ -120,11 +120,11 @@ public class KernelSystem : SystemBase, IParticleSystem
         var world = World.DefaultGameObjectInjectionWorld;
         m_BuildPhysicsWorld = world.GetOrCreateSystem<BuildPhysicsWorld>();
         m_StepPhysicsWorld = world.GetOrCreateSystem<StepPhysicsWorld>();
+#if !KERNEL_DYNAMIC_BUFFER
         inputDependency = default;
         outputDependency = default;
-
+#endif
         AllocateArrays();
-
         frameNumber = 0;
     }
 
@@ -135,6 +135,7 @@ public class KernelSystem : SystemBase, IParticleSystem
 
     protected void AllocateArrays ()
     {
+#if !KERNEL_DYNAMIC_BUFFER
         // TODO: Rework the interactionPairs and kernelContribution structures
         //       Goals: Eliminate the need to know size at physics schedule-time
         //       Ideas: 
@@ -167,6 +168,7 @@ public class KernelSystem : SystemBase, IParticleSystem
 #else
         kernelContributions = new NativeHashMap<EntityOrderedPair, float4>(interactionMax, Allocator.TempJob);
 #endif
+#endif
     }
 
     protected void DisposeArrays()
@@ -194,9 +196,10 @@ public class KernelSystem : SystemBase, IParticleSystem
             Debug.Log("Particle count: " + particleCount.ToString());
             Debug.Log("Avg interactions per particle: " + (interactionCount/particleCount).ToString());
         }
-        
+#if !KERNEL_DYNAMIC_BUFFER
         interactionPairs.Dispose();
         kernelContributions.Dispose();
+#endif
 
         // Reset our input Dependency, so we can start collecting for the next frame
         inputDependency = default;
@@ -225,9 +228,11 @@ public class KernelSystem : SystemBase, IParticleSystem
            { 
                 int batchCount = 1; // How many interaction pairs should a worker process before returning to the pool?
 
+#if !KERNEL_DYNAMIC_BUFFER
                 // Capture local vars
                 var interactionPairs = KernelSystem.interactionPairs;
                 var kernelContributions = KernelSystem.kernelContributions;
+#endif
 
                 // Try Get sim.StepContext.PhasedDispatchPais with reflection
                 // This is an internal array in the physics system of object pairs from the broadphase.
@@ -244,8 +249,10 @@ public class KernelSystem : SystemBase, IParticleSystem
                     bodies = pw.Bodies,
                     smoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true), // RO access to particle smoothing size
                     translationData = GetComponentDataFromEntity<Translation>(true),
+#if !KERNEL_DYNAMIC_BUFFER
                     interactionPairsWriter = interactionPairs.AsParallelWriter(),
                     kernelContributionWriter = kernelContributions.AsParallelWriter(),
+#endif
                 };
                 inputDeps = capturePairsTest.Schedule(phasedDispatchPairs, batchCount, inputDeps);
 
@@ -254,15 +261,20 @@ public class KernelSystem : SystemBase, IParticleSystem
 
                 // Count our interacting neighbors
                 inputDeps = Entities
+#if !KERNEL_DYNAMIC_BUFFER
                 .WithReadOnly(interactionPairs)
+#endif
                 .ForEach((Entity i, ref ParticleSmoothing smoothing_i) =>
                 {
                     smoothing_i.interactCount = 0;
+#if KERNEL_DYNAMIC_BUFFER
+#else
                     foreach (var j in interactionPairs.GetValuesForKey(i))
                     {
                         // Count interacting neighbors which we pay calculation costs for down the line
                         smoothing_i.interactCount += 1;
                     }
+#endif
                 }).ScheduleParallel(inputDeps);
 
                 var scheduledJobHandle = JobHandle.CombineDependencies(inputDeps, Dependency);
@@ -307,7 +319,7 @@ public class KernelSystem : SystemBase, IParticleSystem
 
         [ReadOnly]
         public ComponentDataFromEntity<Translation> translationData;
-
+#if !KERNEL_DYNAMIC_BUFFER
         [WriteOnly]
         public NativeMultiHashMap<Entity, Entity>.ParallelWriter interactionPairsWriter;
 
@@ -317,7 +329,7 @@ public class KernelSystem : SystemBase, IParticleSystem
 #else
         public NativeHashMap<EntityOrderedPair, float4>.ParallelWriter kernelContributionWriter;
 #endif
-
+#endif
         public void Execute(int index)
         {
             DispatchPairSequencer.DispatchPair dispatchPair = phasedDispatchPairs[index];
@@ -350,6 +362,7 @@ public class KernelSystem : SystemBase, IParticleSystem
             // time in iteration.
             if (kernel.w > 0.0f)
             {
+#if !KERNEL_DYNAMIC_BUFFER
                 // We do double updates under particle exchange because we are called once per pair
                 // and both the fact of the interaction and the kernel contribution are symmetric.
 
@@ -361,6 +374,7 @@ public class KernelSystem : SystemBase, IParticleSystem
 #else
                 kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), kernel);
                 kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new float4(-kernel.xyz, kernel.w));
+#endif
 #endif
             }
         }

@@ -38,16 +38,21 @@ public class PressureFieldSystem : SystemBase
         // Then we will update all the pressure derivatives using the pressures as input via the
         // usual SPH formula
 
+#if !KERNEL_DYNAMIC_BUFFER
         // These are all the pre-calculated data we will need about the jth particle
         var interactionPairs = KernelSystem.interactionPairs;
         var kernelContributions = KernelSystem.kernelContributions;
+#endif
         var massData = GetComponentDataFromEntity<ParticleMass>(true);
         var densityData = GetComponentDataFromEntity<ParticleDensity>(true);
         var pressureData = GetComponentDataFromEntity<ParticlePressure>(true);
 
         // Update densities particle-by-particle
-        Entities.WithReadOnly(interactionPairs).WithReadOnly(kernelContributions)
+        Entities
+#if !KERNEL_DYNAMIC_BUFFER
+            .WithReadOnly(interactionPairs).WithReadOnly(kernelContributions)
             .WithReadOnly(massData).WithReadOnly(densityData).WithReadOnly(pressureData)
+#endif
             .ForEach((
                 Entity i,
                 ref ParticlePressureGrad pressureGrad_i, // Should be write-only
@@ -57,7 +62,8 @@ public class PressureFieldSystem : SystemBase
             {
                 // Self contribution to pressure Gradient?
                 float3 pressure_grad = float3.zero;
-
+#if KERNEL_DYNAMIC_BUFFER
+#else
                 // Other particle contributions to density
                 foreach (var j in interactionPairs.GetValuesForKey(i))
                 {
@@ -69,6 +75,7 @@ public class PressureFieldSystem : SystemBase
 
                     pressure_grad += kernelGrad * (m_j / rho_j * P_j);
                 }
+#endif
 
                 // Pack gradient back into component.
                 pressureGrad_i.Value = pressure_grad;

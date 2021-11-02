@@ -25,17 +25,21 @@ public class DensityFieldSystem : SystemBase, IParticleSystem
         var kernelSystem = World.GetExistingSystem<KernelSystem>();
         Dependency = JobHandle.CombineDependencies(kernelSystem.GetOutputDependency(), Dependency);
 
+#if !KERNEL_DYNAMIC_BUFFER
         // Get the interaciton pairs and kernel values for those pairs populated by the KernelSystem
         var interactionPairs = KernelSystem.interactionPairs;
         var kernelContributions = KernelSystem.kernelContributions;
+#endif
         // RO access to particle mass data
         var massData = GetComponentDataFromEntity<ParticleMass>(true); 
         
+       
         // Update densities particle-by-particle
         Entities
-            .WithReadOnly(interactionPairs)
-            .WithReadOnly(kernelContributions)
+#if !KERNEL_DYNAMIC_BUFFER
+            .WithReadOnly(interactionPairs).WithReadOnly(kernelContributions)
             .WithReadOnly(massData)
+#endif
             .ForEach(( 
                 Entity i, 
                 ref ParticleDensity density_i, // Should be write-only
@@ -44,9 +48,10 @@ public class DensityFieldSystem : SystemBase, IParticleSystem
         {
             // Self contribution to density
             var density = mass_i.Value * SplineKernel.Kernel(0, smoothing_i.h);
-            
+
             // Other particle contributions to density
-            
+#if KERNEL_DYNAMIC_BUFFER
+#else
             foreach(var j in interactionPairs.GetValuesForKey(i))
             {
                 var pair = new EntityOrderedPair(i, j);
@@ -57,6 +62,7 @@ public class DensityFieldSystem : SystemBase, IParticleSystem
 #endif
                 density += massData[j].Value * kernel;
             }
+#endif
             
             density_i.Value = density;
         }).ScheduleParallel();
