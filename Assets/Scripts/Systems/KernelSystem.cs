@@ -36,7 +36,9 @@ public struct EntityOrderedPair : IEquatable<EntityOrderedPair>
 }
 
 
-// Copied from IPhysicSystem because its a good idea generally
+// Copied from IPhysicsSystem because this is a good idea generally
+// for systems that have to run in-order repeatedly and handle their
+// own data structure cleanup
 interface IParticleSystem
 {
     void AddInputDependency(JobHandle inputDep);
@@ -175,24 +177,22 @@ public class KernelSystem : SystemBase, IParticleSystem
         // Wait for our consumers to be done with the data before disposal
         inputDependency.Complete();
 
-        
         // Once we know we're the last ones, collect some statistics
-        if (frameNumber % 100 == 0)
+        if (frameNumber % 10 == 0)
         {
-            var uniqueKeys = interactionPairs.GetUniqueKeyArray(Allocator.Temp);
-            float avg = 0.0f;
-            int count = 0;
-            foreach(var key in uniqueKeys.Item1)
+            var particleCount = 0;
+            var interactionCount = 0;
+            // Block the main thread until completion here
+            Entities.ForEach((in ParticleSmoothing a) =>
             {
-                var n = interactionPairs.CountValuesForKey(key);
-                avg = (avg * count + n) / (count + 1.0f);
-                count++;
-            }
+                particleCount += 1;
+                interactionCount += a.interactCount;
+            }).Run();
+           
             Debug.Log("Frame " + frameNumber);
-            Debug.Log("Interaction Pairs: " + (interactionPairs.Count()/2.0f).ToString());
-            Debug.Log("Particle count: " + (count / 2.0f).ToString());
-            Debug.Log("Avg interactions per particle: " + avg.ToString());
-            uniqueKeys.Item1.Dispose();
+            Debug.Log("Interaction Pairs: " + interactionCount.ToString());
+            Debug.Log("Particle count: " + particleCount.ToString());
+            Debug.Log("Avg interactions per particle: " + (interactionCount/particleCount).ToString());
         }
         
         interactionPairs.Dispose();
@@ -223,86 +223,54 @@ public class KernelSystem : SystemBase, IParticleSystem
         m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostCreateDispatchPairs,
            (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
            { 
-               int batchCount = 1; // How many interaction pairs should a worker process before returning to the pool?
-               bool new_method = true;
+                int batchCount = 1; // How many interaction pairs should a worker process before returning to the pool?
 
-               if (new_method)
-               {
-                   // Try Get sim.StepContext.PhasedDispatchPais with reflection
-                   // This is an internal array in the physics system of object pairs from the broadphase.
-                   // We need this array to distribute processing of pairs across threads
-                   // What we are doing is essentially an IBodyPairsJob, but multithreaded
-                   var stepContextFieldInfo = sim.GetType().GetField("StepContext", BindingFlags.NonPublic | BindingFlags.Instance);
-                   var stepContext = stepContextFieldInfo.GetValue(sim);
-                   var phasedDispatchPairsFieldInfo = stepContext.GetType().GetField("PhasedDispatchPairs", BindingFlags.Public | BindingFlags.Instance);
-                   var phasedDispatchPairs = (NativeList<DispatchPairSequencer.DispatchPair>)phasedDispatchPairsFieldInfo.GetValue(stepContext);
+                // Capture local vars
+                var interactionPairs = KernelSystem.interactionPairs;
+                var kernelContributions = KernelSystem.kernelContributions;
 
-                   var capturePairsTest = new InteractionPairsJob3()
-                   {
-                       phasedDispatchPairs = phasedDispatchPairs,
-                       bodies = pw.Bodies,
-                       smoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true), // RO access to particle smoothing size
-                       translationData = GetComponentDataFromEntity<Translation>(true),
-                       interactionPairsWriter = interactionPairs.AsParallelWriter(),
-                       kernelContributionWriter = kernelContributions.AsParallelWriter(),
-                   };
-                   inputDeps = capturePairsTest.Schedule(phasedDispatchPairs, batchCount, inputDeps);
+                // Try Get sim.StepContext.PhasedDispatchPais with reflection
+                // This is an internal array in the physics system of object pairs from the broadphase.
+                // We need this array to distribute processing of pairs across threads
+                // What we are doing is essentially an IBodyPairsJob, but multithreaded
+                var stepContextFieldInfo = sim.GetType().GetField("StepContext", BindingFlags.NonPublic | BindingFlags.Instance);
+                var stepContext = stepContextFieldInfo.GetValue(sim);
+                var phasedDispatchPairsFieldInfo = stepContext.GetType().GetField("PhasedDispatchPairs", BindingFlags.Public | BindingFlags.Instance);
+                var phasedDispatchPairs = (NativeList<DispatchPairSequencer.DispatchPair>)phasedDispatchPairsFieldInfo.GetValue(stepContext);
 
-                   var disablePairs = new DisablePairsJob();
-                   inputDeps = disablePairs.Schedule(sim, ref pw, inputDeps);
-               }
-               else
-               {
-                   var capturePairs = new InteractionPairsJob2()
-                   {
-                       interactionPairsWriter = interactionPairs.AsParallelWriter(),
-                       kernelContributionWriter = kernelContributions.AsParallelWriter(),
-                       smoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true), // RO access to particle smoothing size
-                       translationData = GetComponentDataFromEntity<Translation>(true)
-                   };
-                   inputDeps = capturePairs.Schedule(sim, ref pw, inputDeps);
-               }
-               var scheduledJobHandle = JobHandle.CombineDependencies(inputDeps, Dependency);
+                var capturePairsTest = new InteractionPairsJob()
+                {
+                    phasedDispatchPairs = phasedDispatchPairs,
+                    bodies = pw.Bodies,
+                    smoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true), // RO access to particle smoothing size
+                    translationData = GetComponentDataFromEntity<Translation>(true),
+                    interactionPairsWriter = interactionPairs.AsParallelWriter(),
+                    kernelContributionWriter = kernelContributions.AsParallelWriter(),
+                };
+                inputDeps = capturePairsTest.Schedule(phasedDispatchPairs, batchCount, inputDeps);
+
+                var disablePairs = new DisablePairsJob();
+                inputDeps = disablePairs.Schedule(sim, ref pw, inputDeps);
+
+                // Count our interacting neighbors
+                inputDeps = Entities
+                .WithReadOnly(interactionPairs)
+                .ForEach((Entity i, ref ParticleSmoothing smoothing_i) =>
+                {
+                    smoothing_i.interactCount = 0;
+                    foreach (var j in interactionPairs.GetValuesForKey(i))
+                    {
+                        // Count interacting neighbors which we pay calculation costs for down the line
+                        smoothing_i.interactCount += 1;
+                    }
+                }).ScheduleParallel(inputDeps);
+
+                var scheduledJobHandle = JobHandle.CombineDependencies(inputDeps, Dependency);
                
-               outputDependency = scheduledJobHandle;
+                outputDependency = scheduledJobHandle;
 
-               return scheduledJobHandle;
+                return scheduledJobHandle;
            }, Dependency);
-
-#if false// Old way to do this with a physics ITriggerEvents job
-        m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostCreateDispatchPairs,
-           (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
-           {
-               var capturePairs = new InteractionPairsJob2()
-               {
-                   interactionPairsWriter = interactionPairs.AsParallelWriter(),
-                   kernelContributionWriter = kernelContributions.AsParallelWriter(),
-                   smoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true), // RO access to particle smoothing size
-                   translationData = GetComponentDataFromEntity<Translation>(true),
-                   frameNumber = frameNumber,
-               };
-
-               this.interactionsJobHandle = capturePairs.Schedule(sim, ref pw, inputDeps);
-
-               return interactionsJobHandle;
-           }, 
-           Dependency);
- 
-        var translationData = GetComponentDataFromEntity<Translation>(true); // RO access to particle positions
-        var capturePairs = new InteractionPairsJob()
-        {
-            interactionPairsWriter = interactionPairs.AsParallelWriter(),
-            kernelContributionWriter = kernelContributions.AsParallelWriter(),
-            smoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true), // RO access to particle smoothing size
-            translationData = translationData,
-            frameNumber = frameNumber,
-        };
-
-        // Schedule a collision job to go through all interacting i, j pairs, compute kernel + derivatives, and put them in the hashmap
-        Dependency = capturePairs.Schedule(m_StepPhysicsWorld.Simulation, ref m_BuildPhysicsWorld.PhysicsWorld, Dependency);
-
-        interactionsJobHandle = Dependency;
-#endif
         
         frameNumber++;
     }
@@ -326,7 +294,7 @@ public class KernelSystem : SystemBase, IParticleSystem
 
 
     [BurstCompile]
-    public struct InteractionPairsJob3 : IJobParallelForDefer
+    public struct InteractionPairsJob : IJobParallelForDefer
     {
         [ReadOnly]
         public NativeList<DispatchPairSequencer.DispatchPair> phasedDispatchPairs;
@@ -365,9 +333,6 @@ public class KernelSystem : SystemBase, IParticleSystem
             // TODO: Skip if both entities aren't particles..?
             //       We are disabling physics below, and should probably only do that on SPH particles
 
-            interactionPairsWriter.Add(i, j);
-            interactionPairsWriter.Add(j, i);
-
             var r_i = translationData[i].Value;
             var r_j = translationData[j].Value;
 
@@ -380,157 +345,24 @@ public class KernelSystem : SystemBase, IParticleSystem
             float4 kernel_j = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[j].h);
             var kernel = (kernel_i + kernel_j) * 0.5f;
 
-            // We do double updates under particle exchange because we are called once per pair
-            // and both the fact of the interaction and the kernel contribution are symmetric.
-#if USE_KC
-            kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), new KernelContribution { Value = kernel });
-            kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new KernelContribution { Value = new float4(-kernel.xyz, kernel.w) });
-#else
-            kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), kernel);
-            kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new float4(-kernel.xyz, kernel.w));
-#endif
-
-            /*
-            if (index % 10000 == 0)
+            // Only insert to data structures later steps use for iteration if there's
+            // a weight greater than zero for this pair. This saves every later calculation
+            // time in iteration.
+            if (kernel.w > 0.0f)
             {
-                Debug.Log("Got here index " + index.ToString());
+                // We do double updates under particle exchange because we are called once per pair
+                // and both the fact of the interaction and the kernel contribution are symmetric.
+
+                interactionPairsWriter.Add(i, j);
+                interactionPairsWriter.Add(j, i);
+#if USE_KC
+                kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), new KernelContribution { Value = kernel });
+                kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new KernelContribution { Value = new float4(-kernel.xyz, kernel.w) });
+#else
+                kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), kernel);
+                kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new float4(-kernel.xyz, kernel.w));
+#endif
             }
-            */
         }
     }
-
-    // TODO: Perf! Parallelize this! Requires some looking into physics internals, removing reliance on being an IBodyPairsJob
-    //       This means we're going to have to be an IParallel job (similar to ParallelCreateContactsJob in NarroPhase)
-    //       and hope that we have access to the right parts of physics. We will probably need to stream object pairs using NativeStream
-    //       similar to how ParalllelCreateContactsJob works.
-    //       Every frame is blocked for ~4ms (xcxc Update!) on this, because all of SPH depends on interaction pairs 
-    [BurstCompile]
-    public struct InteractionPairsJob2 : IBodyPairsJob
-    {
-        // Note that the only job this has is to record adjacency from one entity to another
-        // Under the hood an entity is "just" two integers. There are probably some space trade-offs that
-        // could be made here. Thematically this is a very large (#particles x #particles) sparse binary array
-        // which we are storing as a multi-map.
-        
-        [WriteOnly]
-        public NativeMultiHashMap<Entity, Entity>.ParallelWriter interactionPairsWriter;
-
-        [WriteOnly]
-#if USE_KC
-        public NativeHashMap<EntityOrderedPair, KernelContribution>.ParallelWriter kernelContributionWriter;
-#else
-        public NativeHashMap<EntityOrderedPair, float4>.ParallelWriter kernelContributionWriter;
-
-#endif
-
-        [ReadOnly]
-        public ComponentDataFromEntity<ParticleSmoothing> smoothingData;
-
-        [ReadOnly]
-        public ComponentDataFromEntity<Translation> translationData;
-
-        //[ReadOnly]
-        //public int frameNumber;
-
-
-        public void Execute(ref ModifiableBodyPair triggerEvent)
-        {
-            triggerEvent.Disable();
-            // Stop physics from doing more with this collision!
-            // no jacobians! No collision response!
-            // only step velocity integration!
-
-
-            // Note: This will add some things that are not SPH particles until we have a collision filter
-            //       The math part is written so it will just crash if we are passed not-a-particle
-            var i = triggerEvent.EntityA;
-            var j = triggerEvent.EntityB;
-
-            //interactionPairsWriter.Add(i, j);
-            //interactionPairsWriter.Add(j, i);
-            
-            var r_i = translationData[i].Value;
-            var r_j = translationData[j].Value;
-            
-            //var distance = math.length(r_i - r_j);
-
-            // Calculate symmetrized kernel contribution
-            // We do the version with derivative at particle i, but by symmetry
-            // (I think!) the opposite order gradient is just a blanket minus sign.
-            float4 kernel_i = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[i].h);
-            float4 kernel_j = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[j].h);
-            var kernel = (kernel_i + kernel_j) * 0.5f;
-
-            // We do double updates under particle exchange because we are called once per pair
-            // and both the fact of the interaction and the kernel contribution are symmetric.
-#if USE_KC
-            kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), new KernelContribution { Value = kernel });
-            kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new KernelContribution { Value = new float4(-kernel.xyz, kernel.w) });
-#else
-            kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), kernel);
-            kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new float4(-kernel.xyz, kernel.w));
-#endif
-        }
-    }
-
-#if false // old ITriggerEventsJob way
-    // TODO Name this better?
-    // 
-    // This gets called once per frame on every pair of particles that currently have intersecting
-    // collision geometry. This means they are within particle_radius of each other.
-    //
-    [BurstCompile]
-    public struct InteractionPairsJob : ITriggerEventsJob
-    {
-        // Note that the only job this has is to record adjacency from one entity to another
-        // Under the hood an entity is "just" two integers. There are probably some space trade-offs that
-        // could be made here. Thematically this is a very large (#particles x #particles) sparse binary array
-        // which we are storing as a multi-map.
-        [WriteOnly]
-        public NativeMultiHashMap<Entity, Entity>.ParallelWriter interactionPairsWriter;
-
-        [WriteOnly]
-        public NativeHashMap<EntityOrderedPair, float4>.ParallelWriter kernelContributionWriter;
-
-        [ReadOnly]
-        public ComponentDataFromEntity<ParticleSmoothing> smoothingData;
-
-        [ReadOnly]
-        public ComponentDataFromEntity<Translation> translationData;
-
-        [ReadOnly]
-        public int frameNumber;
-        public void Execute(TriggerEvent triggerEvent)
-        {
-            // Note: This will add some things that are not SPH particles until we have a collision filter
-            //       The math part is written so it will just crash if we are passed not-a-particle
-            var i = triggerEvent.EntityA;
-            var j = triggerEvent.EntityB;
-
-            var r_i = translationData[i].Value;
-            var r_j = translationData[j].Value;
-            // Calculate distance
-            var distance = math.length(translationData[i].Value - translationData[j].Value);
-
-            // Calculate symmetrized kernel contribution
-            // We do the version with derivative at particle i, but by symmetry
-            // (I think!) the opposite order gradient is just a blanket minus sign.
-            float4 kernel_i = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[i].h);
-            float4 kernel_j = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[j].h);
-            var kernel = (kernel_i + kernel_j) * 0.5f;
-
-            // We do double updates under particle exchange because we are called once per pair
-            // and both the fact of the interaction and the kernel contribution are symmetric.
-            kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), kernel);
-            kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new float4(- kernel.xyz, kernel.w));
-
-            interactionPairsWriter.Add(i, j);
-            interactionPairsWriter.Add(j, i);
-
-            //Debug.Log("Trigger on frame number " + frameNumber.ToString() +
-            //    " between A: " + triggerEvent.EntityA.ToString() +
-            //    " and B: " + triggerEvent.EntityB.ToString());
-        }
-    }
-#endif
 }
