@@ -47,6 +47,8 @@ public class GravityFieldSystem : SystemBase
         var massData = GetComponentDataFromEntity<ParticleMass>(true);
         var translationData = GetComponentDataFromEntity<Translation>(true);
 
+        float gravConstant = 1.0f;
+
         Entities.WithReadOnly(massData).WithReadOnly(translationData)
             .WithReadOnly(entityDataLocal).WithDisposeOnCompletion(entityDataLocal)
             .ForEach((Entity i, ref GravityField grav_i, // Should be write-only?
@@ -92,7 +94,7 @@ public class GravityFieldSystem : SystemBase
                     }
 
                     float3 grav_field = displacement * ( - grav_mag_over_r );
-                    gravity += new float4(grav_field, grav_potential);
+                    gravity += new float4(gravConstant * grav_field, gravConstant * grav_potential);
                 }
 
                 grav_i.Value = gravity;
