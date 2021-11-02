@@ -10,8 +10,6 @@ using Unity.Transforms;
 using UnityEngine;
 using UnityEngine.Rendering;
 
-
-
 // Some notes:
 // Current debug version of this with 1k particles rendering is running slow when particle meshes overlap.
 // I think this time is being spent in Hybrid Renderer, and in some Debug streaming systems

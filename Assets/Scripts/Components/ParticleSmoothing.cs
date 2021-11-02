@@ -17,4 +17,6 @@ public struct ParticleSmoothing : IComponentData
 
     // How many particles are interacting with this one as given by a nonzero kernel function
     public int interactCount;
+
 }
+
