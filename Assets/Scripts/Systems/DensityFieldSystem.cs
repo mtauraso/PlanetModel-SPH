@@ -7,10 +7,20 @@ using Unity.Burst;
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
 [UpdateAfter(typeof(StepPhysicsWorld))]
-public class DensityFieldSystem : SystemBase
+public class DensityFieldSystem : SystemBase, IParticleSystem
 {
+    public void AddInputDependency(JobHandle jh)
+    {
+        inputDependency = JobHandle.CombineDependencies(jh, inputDependency);
+    }
+    private JobHandle inputDependency;
+    public JobHandle GetOutputDependency() => Dependency;
+
     protected override void OnUpdate()
     {
+        // ensure any system that registered a dependency is done with our data
+        inputDependency.Complete();
+
         //Debug.Log("DensityFieldSystem on Update");
         var kernelSystem = World.GetExistingSystem<KernelSystem>();
         Dependency = JobHandle.CombineDependencies(kernelSystem.GetOutputDependency(), Dependency);

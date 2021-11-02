@@ -99,8 +99,8 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
         entityManager.AddComponentData(prototype, new ParticleMass());
         entityManager.AddComponentData(prototype, new ParticleDensity());
         entityManager.AddComponentData(prototype, new GravityField());
-        
-        
+        entityManager.AddComponentData(prototype, new ParticlePressure());
+        entityManager.AddComponentData(prototype, new ParticlePressureGrad());
 
         var spawnJob = new SpawnParticleJob
         {
@@ -213,9 +213,11 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
             Ecb.SetComponent(index, e, new ParticleMass { Value = particleMass });
             Ecb.SetComponent(index, e, new ParticleDensity { Value = density });
 
-            // Gravity field does not depend on estimate in previous frames
+            // These are just data elements, we don't need to add initial values because
+            // They will be calculated from what we have provided so far above
             Ecb.SetComponent(index, e, new GravityField { Value = float4.zero });
-
+            Ecb.SetComponent(index, e, new ParticlePressure { Value = 0.0f });
+            Ecb.SetComponent(index, e, new ParticlePressureGrad { Value = float3.zero });
         }
 
         // Uses a rejection sampling approach to generate a random float3 which is inside the sphere

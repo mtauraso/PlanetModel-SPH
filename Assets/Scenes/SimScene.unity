@@ -277,7 +277,7 @@ MonoBehaviour:
   count: 1000
   particleRadius: 1
   radius: 3
-  totalMass: 1
+  totalMass: 1000
 --- !u!135 &948306070
 SphereCollider:
   m_ObjectHideFlags: 0
