@@ -46,13 +46,11 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
     public int count;
 
     // How big each particle (this is the initial smoothing length kh)
-    public float particle_radius;
+    public float particleRadius;
 
     // Radius and center of the area where we blast the particles.
-    // TODO: Radius is currently also the individual particle collision radius
-    public float3 center;
     public float radius;
-    public float total_mass;
+    public float totalMass;
 
     public void Convert(Entity entity, EntityManager dstManager, GameObjectConversionSystem conversionSystem)
     {
@@ -109,9 +107,9 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
             prototype = prototype,
             Ecb = ecb.AsParallelWriter(),
             count = count,
-            particle_radius = particle_radius,
-            total_mass = total_mass,
-            center = center,
+            particleRadius = particleRadius,
+            totalMass = totalMass,
+            center = transform.position,
             radius = radius,
             rngFactory = world.GetExistingSystem<RandomSystem>().getRngFactory(),
         };
@@ -134,10 +132,10 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
         public int count;
 
         // How big each particle
-        public float particle_radius;
+        public float particleRadius;
 
         // How much mass distributed over all particles
-        public float total_mass;
+        public float totalMass;
 
         // Where to center our random particle distribution
         public float3 center;
@@ -155,14 +153,14 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
 
             // Randomly generate some initial conditions
             float3 position;
-            float3 particle_velocity;
-            float4 base_color;
+            float3 particleVelocity;
+            float4 baseColor;
             using (var rng = rngFactory.GetRng())
             {
                 position = center + RandomFloat3WithinSphere(rng, radius);
-                particle_velocity = RandomFloat3WithinSphere(rng, 1.0f);
-                //particle_velocity = float3.zero;
-                base_color = new float4(rng.NextFloat3(1.0f), 0);
+                particleVelocity = RandomFloat3WithinSphere(rng, 1.0f);
+                //particleVelocity = float3.zero;
+                baseColor = new float4(rng.NextFloat3(1.0f), 0);
             }
 
             // Set up a sphere collision geomtry at the appropriate center which only raises trigger events.
@@ -170,14 +168,14 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
             var collisionFilter = new CollisionFilter { BelongsTo = 1u << 1, CollidesWith = 1u << 1, GroupIndex = 1 };
 
             // TODO: Will need to alter this dynamically when we change kernel characteristic per particle.
-            var physGeometry = new SphereGeometry { Center = position, Radius = particle_radius };
-            var physmat = new Unity.Physics.Material { CollisionResponse = CollisionResponsePolicy.RaiseTriggerEvents };
-            var sphereCollider = Unity.Physics.SphereCollider.Create(physGeometry, collisionFilter, physmat);
+            var physGeometry = new SphereGeometry { Center = position, Radius = particleRadius };
+            var physMaterial = new Unity.Physics.Material { CollisionResponse = CollisionResponsePolicy.RaiseTriggerEvents };
+            var sphereCollider = Unity.Physics.SphereCollider.Create(physGeometry, collisionFilter, physMaterial);
 
             // This is all the components we we need to trigger Unity.Physics to update positions of everything
             // every timestep. This is good because we can lean on Unity.Physics to keep collision lists up to date
             // This is bad because we can't control exactly how it evolves the particles every timestamp, we
-            // just set PhysicsVelocity and it moves the particle for us (Yikes!)
+            // just set PhysicsVelocity and it moves the particle for us (Yikes?)
             Ecb.SetComponent(index, e, new Translation { Value = position });
             Ecb.SetComponent(index, e, new PhysicsCollider { Value = sphereCollider });
 
@@ -185,7 +183,7 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
             // Unsure if we even need that...
 #if !KERNEL_SYSTEM_EXP
             Ecb.SetComponent(index, e, new PhysicsVelocity { 
-                Linear = particle_velocity, 
+                Linear = particleVelocity, 
                 Angular = float3.zero  // Unused by our simulation. Physics needs it
             });
             Ecb.SetComponent(index, e, new Rotation { Value = quaternion.identity }); // Unused by simulation but Physics needs it set.
@@ -193,7 +191,7 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
 #endif
 
             // This is for debug color (use later?)
-            Ecb.SetComponent(index, e, new URPMaterialPropertyBaseColor { Value = base_color });
+            Ecb.SetComponent(index, e, new URPMaterialPropertyBaseColor { Value = baseColor });
 
             // For setting custom size per particle: Transform appears to only scale the mesh used to render the particle
 
@@ -202,17 +200,17 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
             //Ecb.SetComponent(index, e, new Scale { Value = particle_radius * 2 });
 
             // This aligns the default sphere mesh with the size of 'h' (influence area) rather than 'kh' the support domain
-            Ecb.SetComponent(index, e, new Scale { Value = particle_radius * 2 / SplineKernel.Kappa()});
+            Ecb.SetComponent(index, e, new Scale { Value = particleRadius * 2 / SplineKernel.Kappa()});
 
 
             // uniform density distribution
-            var total_volume = (4.0f * Mathf.PI / 3.0f) * radius * radius * radius;
-            var density = total_mass / total_volume;
-            var particle_mass = total_mass / count;
+            var totalVolume = (4.0f * Mathf.PI / 3.0f) * radius * radius * radius;
+            var density = totalMass / totalVolume;
+            var particleMass = totalMass / count;
 
             // Set up per particle initial physical data used by SPH
-            Ecb.SetComponent(index, e, new ParticleSmoothing( particle_radius ));
-            Ecb.SetComponent(index, e, new ParticleMass { Value = particle_mass });
+            Ecb.SetComponent(index, e, new ParticleSmoothing( particleRadius ));
+            Ecb.SetComponent(index, e, new ParticleMass { Value = particleMass });
             Ecb.SetComponent(index, e, new ParticleDensity { Value = density });
 
             // Gravity field does not depend on estimate in previous frames
@@ -223,19 +221,19 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
         // Uses a rejection sampling approach to generate a random float3 which is inside the sphere
         // of radius reject_radius centered at the origin. Rejection sampling approach means that when
         // interpreted as points, these should be uniformly distributed within the sphere.
-        public float3 RandomFloat3WithinSphere(RngFactory.Random rng, float reject_radius)
+        public float3 RandomFloat3WithinSphere(RngFactory.Random rng, float rejectRadius)
         {
-            var reject_radius_sq = reject_radius * reject_radius;
-            bool candidate_good = false;
+            var rejectRadiusSq = rejectRadius * rejectRadius;
+            bool candidateGood = false;
             var candidate = float3.zero;
 
-            while (!candidate_good)
+            while (!candidateGood)
             {
                 // Avoid square roots and divides.
                 candidate = rng.NextFloat3(-radius, radius);
                 var self_dot = candidate * candidate;
-                var candidate_length_sq = self_dot.x + self_dot.y + self_dot.z;
-                candidate_good = (candidate_length_sq <= reject_radius_sq);
+                var candidateLengthSq = self_dot.x + self_dot.y + self_dot.z;
+                candidateGood = (candidateLengthSq <= rejectRadiusSq);
             }
 
             return candidate;
