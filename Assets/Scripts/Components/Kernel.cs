@@ -3,22 +3,12 @@ using Unity.Mathematics;
 
 
 #if KERNEL_DYNAMIC_BUFFER
-// TODO: how many should we keep before we 
-//       ask for a dynamic allocation
-[InternalBufferCapacity(10)]
-public struct InteractionEntity : IBufferElementData
+// TODO: how many should we keep on-chunk before we dynamically allocate?
+[InternalBufferCapacity(8)]
+public struct ParticleInteraction : IBufferElementData
 {
-    public Entity e;
-}
-
-public struct InteractionKernel : IBufferElementData
-{
-    public float w;
-}
-
-public struct InteractionKernelGradient : IBufferElementData
-{
-    public float3 DelW;
+    public Entity Other;
+    public float4 Kernel;
 }
 #endif
 

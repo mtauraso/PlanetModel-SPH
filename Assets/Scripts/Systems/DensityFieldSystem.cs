@@ -6,7 +6,7 @@ using Unity.Burst;
 
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
-[UpdateAfter(typeof(StepPhysicsWorld))]
+[UpdateAfter(typeof(KernelDataSystem))]
 public class DensityFieldSystem : SystemBase, IParticleSystem
 {
     public void AddInputDependency(JobHandle jh)
@@ -35,14 +35,17 @@ public class DensityFieldSystem : SystemBase, IParticleSystem
         
        
         // Update densities particle-by-particle
-        Entities
+        Entities.WithReadOnly(massData)
 #if !KERNEL_DYNAMIC_BUFFER
             .WithReadOnly(interactionPairs).WithReadOnly(kernelContributions)
-            .WithReadOnly(massData)
+            
 #endif
             .ForEach(( 
                 Entity i, 
                 ref ParticleDensity density_i, // Should be write-only
+#if KERNEL_DYNAMIC_BUFFER
+                in DynamicBuffer<ParticleInteraction> interactions,
+#endif
                 in ParticleMass mass_i, 
                 in ParticleSmoothing smoothing_i) =>
         {
@@ -51,6 +54,12 @@ public class DensityFieldSystem : SystemBase, IParticleSystem
 
             // Other particle contributions to density
 #if KERNEL_DYNAMIC_BUFFER
+            foreach(ParticleInteraction interaction in interactions)
+            {
+                Entity j = interaction.Other;
+                var kernel = interaction.Kernel.w;
+                density += massData[j].Value * kernel;
+            }
 #else
             foreach(var j in interactionPairs.GetValuesForKey(i))
             {

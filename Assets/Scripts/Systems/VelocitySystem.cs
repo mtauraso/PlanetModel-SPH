@@ -1,4 +1,4 @@
-#define DISABLE_VELOCITY_SYSTEM
+//#define DISABLE_VELOCITY_SYSTEM
 #if !DISABLE_VELOCITY_SYSTEM
 using Unity.Entities;
 using Unity.Physics;

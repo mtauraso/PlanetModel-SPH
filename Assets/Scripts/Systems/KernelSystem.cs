@@ -55,6 +55,16 @@ public struct KernelContribution
 }
 #endif
 
+[UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
+[UpdateAfter(typeof(StepPhysicsWorld))]
+[AlwaysUpdateSystem]
+public class KernelDataSystem : EntityCommandBufferSystem
+{
+    // I don't think I need anything here
+}
+
+
+
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
 [UpdateAfter(typeof(BuildPhysicsWorld))]
@@ -63,7 +73,9 @@ public class KernelSystem : SystemBase, IParticleSystem
 {
     private BuildPhysicsWorld m_BuildPhysicsWorld;
     private StepPhysicsWorld m_StepPhysicsWorld;
-#if !KERNEL_DYNAMIC_BUFFER
+#if KERNEL_DYNAMIC_BUFFER
+    private KernelDataSystem m_KernelDataSystem;
+#else
     // These arrays are allocated and updated each frame.
     // If you want to use them in a system you need to:
     //
@@ -120,10 +132,12 @@ public class KernelSystem : SystemBase, IParticleSystem
         var world = World.DefaultGameObjectInjectionWorld;
         m_BuildPhysicsWorld = world.GetOrCreateSystem<BuildPhysicsWorld>();
         m_StepPhysicsWorld = world.GetOrCreateSystem<StepPhysicsWorld>();
-#if !KERNEL_DYNAMIC_BUFFER
+#if KERNEL_DYNAMIC_BUFFER
+        m_KernelDataSystem = world.GetOrCreateSystem<KernelDataSystem>();
+#endif
         inputDependency = default;
         outputDependency = default;
-#endif
+
         AllocateArrays();
         frameNumber = 0;
     }
@@ -135,7 +149,9 @@ public class KernelSystem : SystemBase, IParticleSystem
 
     protected void AllocateArrays ()
     {
-#if !KERNEL_DYNAMIC_BUFFER
+#if KERNEL_DYNAMIC_BUFFER
+        return;
+#else
         // TODO: Rework the interactionPairs and kernelContribution structures
         //       Goals: Eliminate the need to know size at physics schedule-time
         //       Ideas: 
@@ -185,10 +201,16 @@ public class KernelSystem : SystemBase, IParticleSystem
             var particleCount = 0;
             var interactionCount = 0;
             // Block the main thread until completion here
-            Entities.ForEach((in ParticleSmoothing a) =>
+#if KERNEL_DYNAMIC_BUFFER
+            Entities.ForEach((in DynamicBuffer<ParticleInteraction> a) => 
             {
-                particleCount += 1;
+                interactionCount += a.Length;
+#else
+            Entities.ForEach((in ParticleSmoothing a) => 
+            {
                 interactionCount += a.interactCount;
+#endif
+                particleCount += 1;          
             }).Run();
            
             Debug.Log("Frame " + frameNumber);
@@ -196,7 +218,20 @@ public class KernelSystem : SystemBase, IParticleSystem
             Debug.Log("Particle count: " + particleCount.ToString());
             Debug.Log("Avg interactions per particle: " + (interactionCount/particleCount).ToString());
         }
-#if !KERNEL_DYNAMIC_BUFFER
+#if KERNEL_DYNAMIC_BUFFER
+        // Go over every particle... and remove every interaction...?
+        // On the main thread of course!
+        // This is not as bad as it seems, because Clear leaves memory capacity allocated
+        // TODO: Trim these from time to time?
+        Entities.ForEach((ref DynamicBuffer<ParticleInteraction> interactions) =>
+        {
+            interactions.Clear();
+        }).Run();
+        // TODO: If Perf issues, schedule this with inputDependency as a dep so we don't delete
+        //       data out from under our consumers then somehow route the dep
+        //       created by this job so that our callback-scheduled job in OnUpdate
+        //       doesn't run until we're done cleaning up.
+#else
         interactionPairs.Dispose();
         kernelContributions.Dispose();
 #endif
@@ -220,20 +255,24 @@ public class KernelSystem : SystemBase, IParticleSystem
         // Because we collect these from the physics system, every A->B will also have a B->A
         DisposeArrays();
         AllocateArrays();
-        
+
+#if KERNEL_DYNAMIC_BUFFER
+        // Command buffer to store additions to DynamicBuffers for later playback
+        KernelDataSystem kernelDataSystem = m_KernelDataSystem;
+        EntityCommandBuffer ecb = kernelDataSystem.CreateCommandBuffer();
+#endif
 
         //Debug.Log("Enqueuing Physics Callback");
         m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostCreateDispatchPairs,
            (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
            { 
-                int batchCount = 1; // How many interaction pairs should a worker process before returning to the pool?
+               int batchCount = 1; // How many interaction pairs should a worker process before returning to the pool?
 
 #if !KERNEL_DYNAMIC_BUFFER
                 // Capture local vars
                 var interactionPairs = KernelSystem.interactionPairs;
                 var kernelContributions = KernelSystem.kernelContributions;
 #endif
-
                 // Try Get sim.StepContext.PhasedDispatchPais with reflection
                 // This is an internal array in the physics system of object pairs from the broadphase.
                 // We need this array to distribute processing of pairs across threads
@@ -249,35 +288,36 @@ public class KernelSystem : SystemBase, IParticleSystem
                     bodies = pw.Bodies,
                     smoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true), // RO access to particle smoothing size
                     translationData = GetComponentDataFromEntity<Translation>(true),
-#if !KERNEL_DYNAMIC_BUFFER
+#if KERNEL_DYNAMIC_BUFFER
+                    interactionDataWriter = ecb.AsParallelWriter(),
+#else
                     interactionPairsWriter = interactionPairs.AsParallelWriter(),
                     kernelContributionWriter = kernelContributions.AsParallelWriter(),
 #endif
                 };
-                inputDeps = capturePairsTest.Schedule(phasedDispatchPairs, batchCount, inputDeps);
+               inputDeps = capturePairsTest.Schedule(phasedDispatchPairs, batchCount, inputDeps);
 
-                var disablePairs = new DisablePairsJob();
+#if KERNEL_DYNAMIC_BUFFER
+               m_KernelDataSystem.AddJobHandleForProducer(inputDeps);
+#endif
+               var disablePairs = new DisablePairsJob();
                 inputDeps = disablePairs.Schedule(sim, ref pw, inputDeps);
 
+#if !KERNEL_DYNAMIC_BUFFER
                 // Count our interacting neighbors
                 inputDeps = Entities
-#if !KERNEL_DYNAMIC_BUFFER
                 .WithReadOnly(interactionPairs)
-#endif
                 .ForEach((Entity i, ref ParticleSmoothing smoothing_i) =>
                 {
                     smoothing_i.interactCount = 0;
-#if KERNEL_DYNAMIC_BUFFER
-#else
                     foreach (var j in interactionPairs.GetValuesForKey(i))
                     {
                         // Count interacting neighbors which we pay calculation costs for down the line
                         smoothing_i.interactCount += 1;
                     }
-#endif
                 }).ScheduleParallel(inputDeps);
-
-                var scheduledJobHandle = JobHandle.CombineDependencies(inputDeps, Dependency);
+#endif
+               var scheduledJobHandle = JobHandle.CombineDependencies(inputDeps, Dependency);
                
                 outputDependency = scheduledJobHandle;
 
@@ -286,6 +326,7 @@ public class KernelSystem : SystemBase, IParticleSystem
         
         frameNumber++;
     }
+    
 
 
     // This job nerfs future physics on any interaction pair identified in 
@@ -319,7 +360,10 @@ public class KernelSystem : SystemBase, IParticleSystem
 
         [ReadOnly]
         public ComponentDataFromEntity<Translation> translationData;
-#if !KERNEL_DYNAMIC_BUFFER
+#if KERNEL_DYNAMIC_BUFFER
+        [WriteOnly]
+        public EntityCommandBuffer.ParallelWriter interactionDataWriter;
+#else
         [WriteOnly]
         public NativeMultiHashMap<Entity, Entity>.ParallelWriter interactionPairsWriter;
 
@@ -350,30 +394,50 @@ public class KernelSystem : SystemBase, IParticleSystem
 
             //var distance = math.length(r_i - r_j);
 
-            // Calculate symmetrized kernel contribution
+            // Calculate symmetrized kernel contribution.
+            // Once for derivatives w.r.t. particle i position, again for derivitives w.r.t. particle j
+            // TODO: There is some duplicaiton of effort here especially on the kernel values
+            // TODO: It is possible to reject pairs before performing this calculation
+
             // We do the version with derivative at particle i, but by symmetry
             // (I think!) the opposite order gradient is just a blanket minus sign.
-            float4 kernel_i = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[i].h);
-            float4 kernel_j = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[j].h);
-            var kernel = (kernel_i + kernel_j) * 0.5f;
+            float4 kernel_ij_i = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[i].h);
+            float4 kernel_ij_j = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[j].h);
+            var kernel_ij = (kernel_ij_i + kernel_ij_j) * 0.5f;
+
+            // By symmetry this may just be:
+            // kernelji = new float4( -kernel_ij.xyz, kernel_ij.w)
+            float4 kernel_ji_i = SplineKernel.KernelAndGradienti(r_j, r_i, smoothingData[i].h);
+            float4 kernel_ji_j = SplineKernel.KernelAndGradienti(r_j, r_i, smoothingData[j].h);
+            var kernel_ji = (kernel_ji_i + kernel_ji_j) * 0.5f;
 
             // Only insert to data structures later steps use for iteration if there's
             // a weight greater than zero for this pair. This saves every later calculation
             // time in iteration.
-            if (kernel.w > 0.0f)
+            if (kernel_ij.w > 0.0f)
             {
-#if !KERNEL_DYNAMIC_BUFFER
+#if KERNEL_DYNAMIC_BUFFER
+                // Reuse index from global order of collisions,
+                // This means we can only deal with 2^30 collisions rather than 2^31 :(
+                int index_i = index << 1;
+                int index_j = index_i + 1;
+
+                // We're going to insert into the buffers of i and j a record represeting
+                // The symmetrized kernel contribution of the other one
+                interactionDataWriter.AppendToBuffer(index_i, i, new ParticleInteraction { Other = j, Kernel = kernel_ij });
+                interactionDataWriter.AppendToBuffer(index_j, j, new ParticleInteraction { Other = i, Kernel = kernel_ji });
+#else
                 // We do double updates under particle exchange because we are called once per pair
                 // and both the fact of the interaction and the kernel contribution are symmetric.
 
                 interactionPairsWriter.Add(i, j);
                 interactionPairsWriter.Add(j, i);
 #if USE_KC
-                kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), new KernelContribution { Value = kernel });
-                kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new KernelContribution { Value = new float4(-kernel.xyz, kernel.w) });
+                kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), new KernelContribution { Value = kernel_ij });
+                kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new KernelContribution { Value = kernel_ji });
 #else
-                kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), kernel);
-                kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), new float4(-kernel.xyz, kernel.w));
+                kernelContributionWriter.TryAdd(new EntityOrderedPair(i, j), kernel_ij);
+                kernelContributionWriter.TryAdd(new EntityOrderedPair(j, i), kernel_ji);
 #endif
 #endif
             }

@@ -12,7 +12,7 @@ using Unity.Burst;
 
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
-[UpdateAfter(typeof(StepPhysicsWorld))]
+[UpdateAfter(typeof(KernelDataSystem))]
 [UpdateAfter(typeof(DensityFieldSystem))]
 public class PressureFieldSystem : SystemBase
 {
@@ -51,31 +51,40 @@ public class PressureFieldSystem : SystemBase
         Entities
 #if !KERNEL_DYNAMIC_BUFFER
             .WithReadOnly(interactionPairs).WithReadOnly(kernelContributions)
-            .WithReadOnly(massData).WithReadOnly(densityData).WithReadOnly(pressureData)
 #endif
+            .WithReadOnly(massData).WithReadOnly(densityData).WithReadOnly(pressureData)
             .ForEach((
                 Entity i,
                 ref ParticlePressureGrad pressureGrad_i, // Should be write-only
+#if KERNEL_DYNAMIC_BUFFER
+                in DynamicBuffer<ParticleInteraction> interactions,
+#endif
                 in ParticleDensity density_i, 
                 in ParticleMass mass_i,
                 in ParticleSmoothing smoothing_i) =>
             {
                 // Self contribution to pressure Gradient?
+                // TODO
                 float3 pressure_grad = float3.zero;
-#if KERNEL_DYNAMIC_BUFFER
-#else
+
                 // Other particle contributions to density
+#if KERNEL_DYNAMIC_BUFFER
+                foreach (var interaction in interactions)
+                {
+                    float3 kernelGrad = interaction.Kernel.xyz;
+                    Entity j = interaction.Other;
+#else
                 foreach (var j in interactionPairs.GetValuesForKey(i))
                 {
                     var pair = new EntityOrderedPair(i, j);
                     float3 kernelGrad = kernelContributions[pair].xyz;
+#endif
                     var m_j = massData[j].Value;
                     var rho_j = densityData[j].Value;
                     var P_j = pressureData[j].Value;
 
                     pressure_grad += kernelGrad * (m_j / rho_j * P_j);
                 }
-#endif
 
                 // Pack gradient back into component.
                 pressureGrad_i.Value = pressure_grad;
