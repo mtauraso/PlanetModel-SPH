@@ -47,7 +47,7 @@ public class GravityFieldSystem : SystemBase
         var massData = GetComponentDataFromEntity<ParticleMass>(true);
         var translationData = GetComponentDataFromEntity<Translation>(true);
 
-        float gravConstant = -1.0f;
+        float gravConstant = 1.0f;
 
         Entities.WithReadOnly(massData).WithReadOnly(translationData)
             .WithReadOnly(entityDataLocal).WithDisposeOnCompletion(entityDataLocal)

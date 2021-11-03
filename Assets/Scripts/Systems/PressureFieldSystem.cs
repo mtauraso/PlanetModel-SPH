@@ -7,8 +7,6 @@ using Unity.Burst;
 
 // Calculate pressure equation of state and 
 // pressure gradient
-//
-
 
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
@@ -38,47 +36,28 @@ public class PressureFieldSystem : SystemBase
         // Then we will update all the pressure derivatives using the pressures as input via the
         // usual SPH formula
 
-#if !KERNEL_DYNAMIC_BUFFER
-        // These are all the pre-calculated data we will need about the jth particle
-        var interactionPairs = KernelSystem.interactionPairs;
-        var kernelContributions = KernelSystem.kernelContributions;
-#endif
         var massData = GetComponentDataFromEntity<ParticleMass>(true);
         var densityData = GetComponentDataFromEntity<ParticleDensity>(true);
         var pressureData = GetComponentDataFromEntity<ParticlePressure>(true);
 
         // Update densities particle-by-particle
-        Entities
-#if !KERNEL_DYNAMIC_BUFFER
-            .WithReadOnly(interactionPairs).WithReadOnly(kernelContributions)
-#endif
-            .WithReadOnly(massData).WithReadOnly(densityData).WithReadOnly(pressureData)
+        Entities.WithReadOnly(massData).WithReadOnly(densityData).WithReadOnly(pressureData)
             .ForEach((
                 Entity i,
                 ref ParticlePressureGrad pressureGrad_i, // Should be write-only
-#if KERNEL_DYNAMIC_BUFFER
                 in DynamicBuffer<ParticleInteraction> interactions,
-#endif
                 in ParticleDensity density_i, 
                 in ParticleMass mass_i,
                 in ParticleSmoothing smoothing_i) =>
             {
-                // Self contribution to pressure Gradient?
-                // TODO
+                // TODO: Self contribution to pressure Gradient?
                 float3 pressure_grad = float3.zero;
 
                 // Other particle contributions to density
-#if KERNEL_DYNAMIC_BUFFER
                 foreach (var interaction in interactions)
                 {
                     float3 kernelGrad = interaction.Kernel.xyz;
                     Entity j = interaction.Other;
-#else
-                foreach (var j in interactionPairs.GetValuesForKey(i))
-                {
-                    var pair = new EntityOrderedPair(i, j);
-                    float3 kernelGrad = kernelContributions[pair].xyz;
-#endif
                     var m_j = massData[j].Value;
                     var rho_j = densityData[j].Value;
                     var P_j = pressureData[j].Value;
