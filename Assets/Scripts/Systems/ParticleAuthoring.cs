@@ -99,6 +99,7 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
         entityManager.AddComponentData(prototype, new GravityField());
         entityManager.AddComponentData(prototype, new ParticlePressure());
         entityManager.AddComponentData(prototype, new ParticlePressureGrad());
+        entityManager.AddBuffer<ParticleInteraction>(prototype);
 
         var spawnJob = new SpawnParticleJob
         {

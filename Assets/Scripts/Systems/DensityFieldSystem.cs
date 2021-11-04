@@ -6,7 +6,7 @@ using Unity.Burst;
 
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
-[UpdateAfter(typeof(StepPhysicsWorld))]
+[UpdateAfter(typeof(KernelDataSystem))]
 public class DensityFieldSystem : SystemBase, IParticleSystem
 {
     public void AddInputDependency(JobHandle jh)
@@ -25,39 +25,28 @@ public class DensityFieldSystem : SystemBase, IParticleSystem
         var kernelSystem = World.GetExistingSystem<KernelSystem>();
         Dependency = JobHandle.CombineDependencies(kernelSystem.GetOutputDependency(), Dependency);
 
-        // Get the interaciton pairs and kernel values for those pairs populated by the KernelSystem
-        var interactionPairs = KernelSystem.interactionPairs;
-        var kernelContributions = KernelSystem.kernelContributions;
         // RO access to particle mass data
         var massData = GetComponentDataFromEntity<ParticleMass>(true); 
         
+       
         // Update densities particle-by-particle
-        Entities
-            .WithReadOnly(interactionPairs)
-            .WithReadOnly(kernelContributions)
-            .WithReadOnly(massData)
-            .ForEach(( 
-                Entity i, 
+        Entities.WithReadOnly(massData).ForEach(( Entity i, 
                 ref ParticleDensity density_i, // Should be write-only
+                in DynamicBuffer<ParticleInteraction> interactions,
                 in ParticleMass mass_i, 
                 in ParticleSmoothing smoothing_i) =>
         {
             // Self contribution to density
             var density = mass_i.Value * SplineKernel.Kernel(0, smoothing_i.h);
-            
+
             // Other particle contributions to density
-            
-            foreach(var j in interactionPairs.GetValuesForKey(i))
+            foreach(ParticleInteraction interaction in interactions)
             {
-                var pair = new EntityOrderedPair(i, j);
-#if USE_KC
-                var kernel = kernelContributions[pair].kernel();
-#else
-                var kernel = kernelContributions[pair].w;
-#endif
+                Entity j = interaction.Other;
+                var kernel = interaction.Kernel.w;
                 density += massData[j].Value * kernel;
             }
-            
+
             density_i.Value = density;
         }).ScheduleParallel();
 
