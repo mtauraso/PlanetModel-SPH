@@ -157,8 +157,8 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
             using (var rng = rngFactory.GetRng())
             {
                 position = center + RandomFloat3WithinSphere(rng, radius);
-                particleVelocity = RandomFloat3WithinSphere(rng, 1.0f);
-                //particleVelocity = float3.zero;
+                //particleVelocity = RandomFloat3WithinSphere(rng, 1.0f);
+                particleVelocity = float3.zero;
                 baseColor = new float4(rng.NextFloat3(1.0f), 0);
             }
 

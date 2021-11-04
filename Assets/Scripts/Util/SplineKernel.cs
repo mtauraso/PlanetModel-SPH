@@ -101,7 +101,7 @@ static class SplineKernel
         float3 kernel_deriv = displacement * ( KernelDeriv(distance, size) / distance);
         float kernel = Kernel(distance, size);
 
-        return new float4(displacement * kernel_deriv, kernel);
+        return new float4(kernel_deriv, kernel);
     }
 
     // Derivative of the kernel with respect to distance argument.
