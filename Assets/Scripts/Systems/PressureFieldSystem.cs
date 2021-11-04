@@ -28,7 +28,7 @@ public class PressureFieldSystem : SystemBase
         // K = 1 for now, but a physically realistic value is K = 2.6*10^12 dyne*cm^4/g^2
         
         Entities.ForEach((ref ParticlePressure pressure_i, in ParticleDensity density_i) => {
-            float K = 1.0f;
+            float K = 1000.0f;
             float pressure = K * density_i.Value * density_i.Value;
             pressure_i.Value = pressure; 
         }).ScheduleParallel();

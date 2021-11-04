@@ -93,8 +93,8 @@ public class GravityFieldSystem : SystemBase
                         grav_potential = -(m / r);
                     }
 
-                    float3 grav_field = displacement * ( - grav_mag_over_r );
-                    gravity += new float4(gravConstant * grav_field, gravConstant * grav_potential);
+                    float3 grav_potential_gradient = displacement * grav_mag_over_r;
+                    gravity += new float4(gravConstant * grav_potential_gradient, gravConstant * grav_potential);
                 }
 
                 grav_i.Value = gravity;

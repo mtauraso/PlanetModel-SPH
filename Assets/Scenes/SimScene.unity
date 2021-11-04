@@ -275,9 +275,9 @@ MonoBehaviour:
   mesh: {fileID: 10207, guid: 0000000000000000e000000000000000, type: 0}
   material: {fileID: 2100000, guid: 2c651728f668a534c808e18d92c51fd8, type: 2}
   count: 1000
-  particleRadius: 1
-  radius: 3
-  totalMass: 1000
+  particleRadius: 10
+  radius: 10
+  totalMass: 10
 --- !u!135 &948306070
 SphereCollider:
   m_ObjectHideFlags: 0
