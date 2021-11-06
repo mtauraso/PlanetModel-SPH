@@ -1,3 +1,7 @@
+//#define RECORD_ALL_COLLISIONS 
+// Debug flag to help understand what is being detected as
+// a collision in simple situations, verify correctness
+
 using System;
 using System.Reflection;
 using UnityEngine;
@@ -10,6 +14,14 @@ using Unity.Mathematics;
 using Unity.Collections;
 using Unity.Burst;
 
+#if RECORD_ALL_COLLISIONS
+[InternalBufferCapacity(8)]
+public struct ParticleCollision : IBufferElementData
+{
+    public Entity Other;
+    public float distance;
+}
+#endif
 
 // EntityPair is a sealed type unfortunately
 public struct EntityOrderedPair : IEquatable<EntityOrderedPair>
@@ -62,45 +74,7 @@ public class KernelDataSystem : EntityCommandBufferSystem
 public class KernelSystem : SystemBase, IParticleSystem
 {
     private StepPhysicsWorld m_StepPhysicsWorld;
-#if KERNEL_DYNAMIC_BUFFER
     private KernelDataSystem m_KernelDataSystem;
-#else
-    // These arrays are allocated and updated each frame.
-    // If you want to use them in a system you need to:
-    //
-    // 1) Schedule at the right time
-    //
-    // [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
-    // [UpdateAfter(typeof(StepPhysicsWorld))]
-    //
-    // 2) Use our IParticleSystem interface. If your system creates values
-    //    Needed downstream, also implement it yourself
-    //
-    //   Jobs that read our arrays need to be Added as an input dependency
-    //   Jobs that read our arrays should wait on our output dependency,
-    //   which is updated after StepPhysicsWorld runs.
-
-
-    // interactionPairs has i, j pairs of interacting particle entities
-    // The mapy is symmetric such that interactionPairs[i] == j <-> interactionPairs[j] == i
-    public static NativeMultiHashMap<Entity, Entity> interactionPairs;
-
-    // This is an array that maps from a pair of entities to a packed version of the kernel
-    // evaluated for that pair.
-    // 
-    // w is the kernel function W
-    // x,y,z are the derivatives of W along the spatial directions
-    // With respect to the first particle in the pair.
-    //
-    // this means that:
-    //    kernelContributions[i,j].w == kernelContributions[j,i].w;
-    //    kernelContributions[i,j].xyz == kernelContributions[j,i].xyz;
-#if USE_KC
-    public static NativeHashMap<EntityOrderedPair, KernelContribution> kernelContributions;
-#else
-    public static NativeHashMap<EntityOrderedPair, float4> kernelContributions;
-#endif
-#endif
 
     public JobHandle GetOutputDependency() => outputDependency;
     private JobHandle outputDependency; // Only valid after StepPhysics runs
@@ -146,10 +120,20 @@ public class KernelSystem : SystemBase, IParticleSystem
         {
             var particleCount = 0;
             var interactionCount = 0;
+#if RECORD_ALL_COLLISIONS
+            var collisionCount = 0;
+#endif
             // Block the main thread until completion here
-            Entities.ForEach((in DynamicBuffer<ParticleInteraction> a) =>
+            Entities.ForEach((in DynamicBuffer<ParticleInteraction> interactions
+#if RECORD_ALL_COLLISIONS
+                ,in DynamicBuffer < ParticleCollision > collisions
+#endif
+                ) =>
             {
-                interactionCount += a.Length;
+                interactionCount += interactions.Length;
+#if RECORD_ALL_COLLISIONS
+                collisionCount += collisions.Length;
+#endif
                 particleCount += 1;
             }).Run();
 
@@ -157,14 +141,25 @@ public class KernelSystem : SystemBase, IParticleSystem
             Debug.Log("Interaction Pairs: " + interactionCount.ToString());
             Debug.Log("Particle count: " + particleCount.ToString());
             Debug.Log("Avg interactions per particle: " + (interactionCount / particleCount).ToString());
+#if RECORD_ALL_COLLISIONS
+            Debug.Log("Collision Pairs: " + collisionCount.ToString());
+            Debug.Log("Avg collisions per particle: " + (collisionCount / particleCount).ToString());
+#endif
         }
 
         // Go over every particle and remove all the kernel contributions.
         // On the main thread of course!
         // This is not as bad as it seems, because Clear leaves memory capacity allocated.
-        Entities.ForEach((ref DynamicBuffer<ParticleInteraction> interactions) =>
+        Entities.ForEach((ref DynamicBuffer<ParticleInteraction> interactions
+#if RECORD_ALL_COLLISIONS
+            ,ref DynamicBuffer<ParticleCollision> collisions
+#endif
+            ) =>
         {
             interactions.Clear();
+#if RECORD_ALL_COLLISIONS
+            collisions.Clear();
+#endif
         }).Run();
 
         // Reset our input Dependency, so we can start collecting for the next frame
@@ -231,7 +226,7 @@ public class KernelSystem : SystemBase, IParticleSystem
             triggerEvent.Disable();
             // Stop physics from doing more with this collision!
             // no jacobians! No collision response!
-            // only step velocity integration!
+            // only step-velocity integration!
         }
     }
 
@@ -264,48 +259,65 @@ public class KernelSystem : SystemBase, IParticleSystem
             }
 
             Entity i = bodies[dispatchPair.BodyIndexA].Entity;
-            Entity j = bodies[dispatchPair.BodyIndexB].Entity;
-
-            // TODO: Skip if both entities aren't particles..?
-            //       We are disabling physics below, and should probably only do that on SPH particles
+            Entity j = bodies[dispatchPair.BodyIndexB].Entity; 
 
             var r_i = translationData[i].Value;
             var r_j = translationData[j].Value;
 
-            //var distance = math.length(r_i - r_j);
+            var distance = math.length(r_i - r_j);
 
             // Calculate symmetrized kernel contribution.
             // Once for derivatives w.r.t. particle i position, again for derivitives w.r.t. particle j
             // TODO: There is some duplicaiton of effort here especially on the kernel values
             // TODO: It is possible to reject pairs before performing this calculation
 
-            // We do the version with derivative at particle i, but by symmetry
-            // (I think!) the opposite order gradient is just a blanket minus sign.
+            // Derivatives are implicitly w.r.t to particle i position.
+            // therefore the "symmetrized" kernel still has a preferred index in the derivative
             float4 kernel_ij_i = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[i].h);
             float4 kernel_ij_j = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[j].h);
-            var kernel_ij = (kernel_ij_i + kernel_ij_j) * 0.5f;
+            var kernel_ij_sym = (kernel_ij_i + kernel_ij_j) * 0.5f;
+            var ij = new ParticleInteraction {
+                Other = j,
+                KernelThis = kernel_ij_i, 
+                KernelOther = kernel_ij_j, 
+                KernelSymmetric = kernel_ij_sym,
+                distance = distance,
+            };
 
-            // By symmetry this may just be:
-            // kernelji = new float4( -kernel_ij.xyz, kernel_ij.w)
+            // The only difference here is the derivatives which are now w.r.t. particle j's position
+            // for an isotropic and even kernel function it should be true that
+            // kernel_ji_sym = new float4( -kernel_ij_sym.xyz, kernel_ij_sym.w)
             float4 kernel_ji_i = SplineKernel.KernelAndGradienti(r_j, r_i, smoothingData[i].h);
             float4 kernel_ji_j = SplineKernel.KernelAndGradienti(r_j, r_i, smoothingData[j].h);
-            var kernel_ji = (kernel_ji_i + kernel_ji_j) * 0.5f;
+            var kernel_ji_sym = (kernel_ji_i + kernel_ji_j) * 0.5f;
+            var ji = new ParticleInteraction
+            {
+                Other = i,
+                KernelThis = kernel_ji_j,
+                KernelOther = kernel_ji_i,
+                KernelSymmetric = kernel_ji_sym,
+                distance = distance,
+            };
+
+            // Reuse index from global order of collisions for when we record into ecb
+            // This means we can only deal with 2^30 interactions max rather than 2^31 :(
+            int index_i = index << 1;
+            int index_j = index_i + 1;
 
             // Only insert to data structures later steps use for iteration if there's
             // a weight greater than zero for this pair. This saves every later calculation
             // time in iteration.
-            if (kernel_ij.w > 0.0f)
+            if (kernel_ij_sym.w > 0.0f)
             {
-                // Reuse index from global order of collisions,
-                // This means we can only deal with 2^30 interactions max rather than 2^31 :(
-                int index_i = index << 1;
-                int index_j = index_i + 1;
-
                 // We're going to insert into the buffers of i and j a record represeting
                 // The symmetrized kernel contribution of the other one
-                interactionDataWriter.AppendToBuffer(index_i, i, new ParticleInteraction { Other = j, Kernel = kernel_ij });
-                interactionDataWriter.AppendToBuffer(index_j, j, new ParticleInteraction { Other = i, Kernel = kernel_ji });
+                interactionDataWriter.AppendToBuffer(index_i, i, ij);
+                interactionDataWriter.AppendToBuffer(index_j, j, ji);
             }
+#if RECORD_ALL_COLLISIONS
+            interactionDataWriter.AppendToBuffer(index_i, i, new ParticleCollision { Other = j , distance = math.length(r_i - r_j) });
+            interactionDataWriter.AppendToBuffer(index_j, j, new ParticleCollision { Other = i , distance = math.length(r_i - r_j) });
+#endif
         }
     }
 }

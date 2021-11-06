@@ -43,7 +43,7 @@ public class DensityFieldSystem : SystemBase, IParticleSystem
             foreach(ParticleInteraction interaction in interactions)
             {
                 Entity j = interaction.Other;
-                var kernel = interaction.Kernel.w;
+                var kernel = interaction.KernelSymmetric.w;
                 density += massData[j].Value * kernel;
             }
 

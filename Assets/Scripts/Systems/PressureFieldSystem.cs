@@ -56,7 +56,7 @@ public class PressureFieldSystem : SystemBase
                 // Other particle contributions to density
                 foreach (var interaction in interactions)
                 {
-                    float3 kernelGrad = interaction.Kernel.xyz;
+                    float3 kernelGrad = interaction.KernelSymmetric.xyz;
                     Entity j = interaction.Other;
                     var m_j = massData[j].Value;
                     var rho_j = densityData[j].Value;

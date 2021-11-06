@@ -1,3 +1,4 @@
+//#define RECORD_ALL_COLLISIONS
 //#define KERNEL_SYSTEM_EXP
 // Also in KernelSystem
 using Unity.Collections;
@@ -9,15 +10,6 @@ using Unity.Rendering;
 using Unity.Transforms;
 using UnityEngine;
 using UnityEngine.Rendering;
-
-// Some notes:
-// Current debug version of this with 1k particles rendering is running slow when particle meshes overlap.
-// I think this time is being spent in Hybrid Renderer, and in some Debug streaming systems
-//
-// You can knock out entire systems (for instance if we know parts of physics won't compute and unity hasn't short-circuited)
-// https://forum.unity.com/threads/enabling-and-disabling-systems-for-unity-ecs.532808/
-//
-
 
 // 
 // Create entities following this pattern, which uses Hybrid Renderer's RenderMeshUtility
@@ -32,11 +24,8 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
 {
     // Allow setting this stuff from the editor for now
     // This is mostly to visualize the particles for debugging purpose
-    //
-    // ? It may be worth coupling this to the Mesh/Material of the underlying authoring object
-    // ? It may also be worth generating the mesh / material in code for better control to do things like:
-    //     - Ensuring mesh geometry matches exactly collision volume
-    //     - Ensuring material is compatible with the overrides we want for rendering
+    // Right now everything only makes sense if the mesh is the default sphere (radius 0.5),
+    // and the material is a default-enough to allow a base color override
     public Mesh mesh;
     public UnityEngine.Material material;
 
@@ -90,7 +79,7 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
         entityManager.AddComponentData(prototype, new URPMaterialPropertyBaseColor());
 
         // So we can set custom size per-particle
-        entityManager.AddComponentData(prototype, new Scale());
+        entityManager.AddComponentData(prototype, new Scale { Value = 1.0f });
 
         //Component data we need for SPH
         entityManager.AddComponentData(prototype, new ParticleSmoothing());
@@ -100,7 +89,25 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
         entityManager.AddComponentData(prototype, new ParticlePressure());
         entityManager.AddComponentData(prototype, new ParticlePressureGrad());
         entityManager.AddBuffer<ParticleInteraction>(prototype);
+#if RECORD_ALL_COLLISIONS
+        entityManager.AddBuffer<ParticleCollision>(prototype);
+#endif
 
+        // TODO: Explicitly run this creation on the main thread, avoid the obfuscation of a job
+        //       This is being done as a parallel-for job with an entity command buffer
+        //       We are probably not getting any performance benefit here because all
+        //       Commands are played on the main thread, and there isn't much math here
+
+        // TODO: Separate out parts having to do with Physical initial condition setup and particle invariant setups
+        //       Physical initial conditions:
+        //       - "Spherical mass distribution according to f(r)"
+        //       - "Overall mass has initial velocity/angular momentum"
+        //       SPH setup
+        //       - "Enough small enough particles that self-gravity is modeled properly"
+        //       - "Particles have a right-sh number of neighbors"
+        //       Needed to run
+        //       - "Particle collision geometry is the right size"
+        //       - 
         var spawnJob = new SpawnParticleJob
         {
             prototype = prototype,
@@ -121,7 +128,7 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
         entityManager.DestroyEntity(prototype);
     } 
     
-    [BurstCompatible]
+
     public struct SpawnParticleJob : IJobParallelFor
     {
         // Entity we use as a prototype to stamp out many entities
@@ -154,11 +161,13 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
             float3 position;
             float3 particleVelocity;
             float4 baseColor;
+            float particleInstanceRadius;
             using (var rng = rngFactory.GetRng())
             {
                 position = center + RandomFloat3WithinSphere(rng, radius);
                 //particleVelocity = RandomFloat3WithinSphere(rng, 1.0f);
                 particleVelocity = float3.zero;
+                particleInstanceRadius = particleRadius * (1 + rng.NextFloat(0.5f));
                 baseColor = new float4(rng.NextFloat3(1.0f), 0);
             }
 
@@ -167,19 +176,16 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
             var collisionFilter = new CollisionFilter { BelongsTo = 1u << 1, CollidesWith = 1u << 1, GroupIndex = 1 };
 
             // TODO: Will need to alter this dynamically when we change kernel characteristic per particle.
-            var physGeometry = new SphereGeometry { Center = position, Radius = particleRadius };
+            var physGeometry = new SphereGeometry { Center = float3.zero, Radius = particleInstanceRadius };
             var physMaterial = new Unity.Physics.Material { CollisionResponse = CollisionResponsePolicy.RaiseTriggerEvents };
             var sphereCollider = Unity.Physics.SphereCollider.Create(physGeometry, collisionFilter, physMaterial);
 
             // This is all the components we we need to trigger Unity.Physics to update positions of everything
             // every timestep. This is good because we can lean on Unity.Physics to keep collision lists up to date
             // This is bad because we can't control exactly how it evolves the particles every timestamp, we
-            // just set PhysicsVelocity and it moves the particle for us (Yikes?)
-            Ecb.SetComponent(index, e, new Translation { Value = position });
+            // just set PhysicsVelocity and it moves the particle for us (Yikes!)
             Ecb.SetComponent(index, e, new PhysicsCollider { Value = sphereCollider });
-
-            // If we're running our own physics kernel, only put a PhysicsCollider on the particle
-            // Unsure if we even need that...
+            Ecb.SetComponent(index, e, new Translation { Value = position });
 #if !KERNEL_SYSTEM_EXP
             Ecb.SetComponent(index, e, new PhysicsVelocity { 
                 Linear = particleVelocity, 
@@ -194,12 +200,16 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
 
             // For setting custom size per particle: Transform appears to only scale the mesh used to render the particle
 
-            // This aligns the default sphere mesh with the collision geometry
+            // This aligns the default sphere mesh with the collision geometry (should be radus kh)
             // We are multiplying by 2 because the default sphere mesh is radius 0.5
-            //Ecb.SetComponent(index, e, new Scale { Value = particle_radius * 2 });
+            Ecb.SetComponent(index, e, new Scale { Value = particleInstanceRadius * 2 });
 
             // This aligns the default sphere mesh with the size of 'h' (influence area) rather than 'kh' the support domain
-            Ecb.SetComponent(index, e, new Scale { Value = particleRadius * 2 / SplineKernel.Kappa()});
+            //Ecb.SetComponent(index, e, new Scale { Value = particleRadius * 2 / SplineKernel.Kappa()});
+
+            // Set a scale factor of 1.0 for debugging
+            //Ecb.SetComponent(index, e, new Scale { Value = 2.0f });
+
 
 
             // uniform density distribution
@@ -208,7 +218,7 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
             var particleMass = totalMass / count;
 
             // Set up per particle initial physical data used by SPH
-            Ecb.SetComponent(index, e, new ParticleSmoothing( particleRadius ));
+            Ecb.SetComponent(index, e, new ParticleSmoothing( particleInstanceRadius ));
             Ecb.SetComponent(index, e, new ParticleMass { Value = particleMass });
             Ecb.SetComponent(index, e, new ParticleDensity { Value = density });
 
@@ -231,7 +241,7 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
             while (!candidateGood)
             {
                 // Avoid square roots and divides.
-                candidate = rng.NextFloat3(-radius, radius);
+                candidate = rng.NextFloat3(-rejectRadius, rejectRadius);
                 var self_dot = candidate * candidate;
                 var candidateLengthSq = self_dot.x + self_dot.y + self_dot.z;
                 candidateGood = (candidateLengthSq <= rejectRadiusSq);
