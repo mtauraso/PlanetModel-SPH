@@ -165,23 +165,17 @@ public class KernelSystem : SystemBase, IParticleSystem
            { 
                 int batchCount = 1; // How many interaction pairs should a worker process before returning to the pool?
 
-               // Job to create an appropriately sized list of NativeQueues
 
                // Hijack the indexing scheme used in physics for ordering rigid bodies
-               // This is a strict over-count of particles but not by much
+               // This is a strict over-count of particles but not by much.
                int numParticles = pw.Bodies.Length;
-
                NativeStream particleInteractions = new NativeStream(numParticles, Allocator.TempJob);
 
                // Job to evaluate kernel across and push into native queues
-                NativeList<DispatchPairSequencer.DispatchPair> phasedDispatchPairs = ((Simulation)sim).StepContext.PhasedDispatchPairs;
-
-               // Also need the solver scheduler info so we can iterate over body pairs multithreaded (similar to solver)
-               var solverSchedulerInfoFieldInfo = stepContext.GetType().GetField("SolverSchedulerInfo", BindingFlags.Public | BindingFlags.Instance);
-               var SolverSchedulerInfo = typeof(DispatchPairSequencer).Assembly.GetType("SolverSchedulerInfo");
-               var solverSchedulerInfo = solverSchedulerInfoFieldInfo.GetValue(stepContext);
-               Type.DefaultBinder.ChangeType(solverSchedulerInfo, SolverSchedulerInfo, System.Globalization.CultureInfo.CurrentCulture);
-
+               // Hijack multithreaded iteration data from Physics Scheduler
+               // We break the ISimulation interface here
+               NativeList<DispatchPairSequencer.DispatchPair> phasedDispatchPairs = ((Simulation)sim).StepContext.PhasedDispatchPairs;
+               DispatchPairSequencer.SolverSchedulerInfo solverSchedulerInfo = ((Simulation)sim).StepContext.SolverSchedulerInfo;
 
                var capturePairsTest = new InteractionPairsJob()
                {
