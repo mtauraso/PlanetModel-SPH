@@ -165,8 +165,6 @@ public class KernelSystem : SystemBase, IParticleSystem
            { 
                 int batchCount = 1; // How many interaction pairs should a worker process before returning to the pool?
 
-
-
                // Job to create an appropriately sized list of NativeQueues
 
                // Hijack the indexing scheme used in physics for ordering rigid bodies
@@ -176,15 +174,7 @@ public class KernelSystem : SystemBase, IParticleSystem
                NativeStream particleInteractions = new NativeStream(numParticles, Allocator.TempJob);
 
                // Job to evaluate kernel across and push into native queues
-               // Try Get sim.StepContext.PhasedDispatchPais with reflection
-               // This is an internal array in the physics system of object pairs from the broadphase.
-               // We need this array to distribute processing of pairs across threads
-               // What we are doing is essentially an IBodyPairsJob, but multithreaded
-               // It is too bad there is no interface for this in Physics
-               var stepContextFieldInfo = sim.GetType().GetField("StepContext", BindingFlags.NonPublic | BindingFlags.Instance);
-               var stepContext = stepContextFieldInfo.GetValue(sim);
-               var phasedDispatchPairsFieldInfo = stepContext.GetType().GetField("PhasedDispatchPairs", BindingFlags.Public | BindingFlags.Instance);
-               var phasedDispatchPairs = (NativeList<DispatchPairSequencer.DispatchPair>)phasedDispatchPairsFieldInfo.GetValue(stepContext);
+                NativeList<DispatchPairSequencer.DispatchPair> phasedDispatchPairs = ((Simulation)sim).StepContext.PhasedDispatchPairs;
 
                // Also need the solver scheduler info so we can iterate over body pairs multithreaded (similar to solver)
                var solverSchedulerInfoFieldInfo = stepContext.GetType().GetField("SolverSchedulerInfo", BindingFlags.Public | BindingFlags.Instance);

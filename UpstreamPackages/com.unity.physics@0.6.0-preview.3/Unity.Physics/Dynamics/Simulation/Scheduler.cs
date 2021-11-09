@@ -124,7 +124,7 @@ namespace Unity.Physics
 
         // A phased set of dispatch pairs used to schedule solver jobs and distribute work between them.
         [NoAlias]
-        internal struct SolverSchedulerInfo : IDisposable
+        public struct SolverSchedulerInfo : IDisposable
         {
             // A structure which describes the number of items in a single phase
             internal struct SolvePhaseInfo

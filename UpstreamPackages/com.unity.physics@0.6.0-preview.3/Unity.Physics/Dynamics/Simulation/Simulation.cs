@@ -183,7 +183,7 @@ namespace Unity.Physics
     }
 
     // Temporary data created and destroyed during the step
-    internal struct StepContext
+    public struct StepContext
     {
         // Built by the scheduler. Groups body pairs into phases in which each
         // body appears at most once, so that the interactions within each phase can be solved
@@ -206,7 +206,7 @@ namespace Unity.Physics
         public JobHandle FinalSimulationJobHandle => m_StepHandles.FinalExecutionHandle;
         public JobHandle FinalJobHandle => JobHandle.CombineDependencies(FinalSimulationJobHandle, m_StepHandles.FinalDisposeHandle);
 
-        internal StepContext StepContext = new StepContext();
+        public StepContext StepContext = new StepContext();
 
         public CollisionEvents CollisionEvents => SimulationContext.CollisionEvents;
 
