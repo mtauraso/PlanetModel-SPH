@@ -5,6 +5,7 @@ using Unity.Mathematics;
 [InternalBufferCapacity(8)]
 public struct ParticleInteraction : IBufferElementData
 {
+    public Entity Self; // Only needed for intermediate queue, could be factored out
     public Entity Other;
     public float4 KernelThis; // w = W(r_i-r_j,h_i) xyz = Del_i W(r_i-r_j,h_i)
     public float4 KernelOther; // w = W(r_i-r_j, h_j) xyz = Del_i W(r_i-r_j,h_j)

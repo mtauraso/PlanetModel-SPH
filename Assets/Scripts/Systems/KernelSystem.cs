@@ -1,3 +1,5 @@
+#define LIST_OF_QUEUES
+//#define COMMAND_BUFFER
 //#define RECORD_ALL_COLLISIONS 
 // Debug flag to help understand what is being detected as
 // a collision in simple situations, verify correctness
@@ -47,7 +49,6 @@ public struct EntityOrderedPair : IEquatable<EntityOrderedPair>
     }
 }
 
-
 // Copied from IPhysicsSystem because this is a good idea generally
 // for systems that have to run in-order repeatedly and handle their
 // own data structure cleanup
@@ -58,15 +59,6 @@ interface IParticleSystem
     JobHandle GetOutputDependency();
 }
 
-[UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
-[UpdateAfter(typeof(StepPhysicsWorld))]
-[AlwaysUpdateSystem]
-public class KernelDataSystem : EntityCommandBufferSystem
-{
-    // No implmentation, this is just to have a buffer that accumulates
-    // Changes to kernel dynamic buffer component
-}
-
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
 [UpdateAfter(typeof(BuildPhysicsWorld))]
@@ -74,7 +66,6 @@ public class KernelDataSystem : EntityCommandBufferSystem
 public class KernelSystem : SystemBase, IParticleSystem
 {
     private StepPhysicsWorld m_StepPhysicsWorld;
-    private KernelDataSystem m_KernelDataSystem;
 
     public JobHandle GetOutputDependency() => outputDependency;
     private JobHandle outputDependency; // Only valid after StepPhysics runs
@@ -94,7 +85,6 @@ public class KernelSystem : SystemBase, IParticleSystem
     {
         var world = World.DefaultGameObjectInjectionWorld;
         m_StepPhysicsWorld = world.GetOrCreateSystem<StepPhysicsWorld>();
-        m_KernelDataSystem = world.GetOrCreateSystem<KernelDataSystem>();
 
         inputDependency = default;
         outputDependency = default;
@@ -170,40 +160,69 @@ public class KernelSystem : SystemBase, IParticleSystem
     {
         Cleanup();
 
-        KernelDataSystem kernelDataSystem = m_KernelDataSystem;
-
-        // Command buffer to store additions to DynamicBuffers for later playback
-        EntityCommandBuffer ecb = kernelDataSystem.CreateCommandBuffer();
-
         m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostCreateDispatchPairs,
            (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
            { 
                 int batchCount = 1; // How many interaction pairs should a worker process before returning to the pool?
 
-                // Try Get sim.StepContext.PhasedDispatchPais with reflection
-                // This is an internal array in the physics system of object pairs from the broadphase.
-                // We need this array to distribute processing of pairs across threads
-                // What we are doing is essentially an IBodyPairsJob, but multithreaded
-                // It is too bad there is no interface for this in Physics
-                var stepContextFieldInfo = sim.GetType().GetField("StepContext", BindingFlags.NonPublic | BindingFlags.Instance);
-                var stepContext = stepContextFieldInfo.GetValue(sim);
-                var phasedDispatchPairsFieldInfo = stepContext.GetType().GetField("PhasedDispatchPairs", BindingFlags.Public | BindingFlags.Instance);
-                var phasedDispatchPairs = (NativeList<DispatchPairSequencer.DispatchPair>)phasedDispatchPairsFieldInfo.GetValue(stepContext);
 
-                var capturePairsTest = new InteractionPairsJob()
-                {
-                    phasedDispatchPairs = phasedDispatchPairs,
-                    bodies = pw.Bodies,
-                    smoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true), // RO access to particle smoothing size
-                    translationData = GetComponentDataFromEntity<Translation>(true),
-                    interactionDataWriter = ecb.AsParallelWriter(),
+
+               // Job to create an appropriately sized list of NativeQueues
+
+               // Hijack the indexing scheme used in physics for ordering rigid bodies
+               // This is a strict over-count of particles but not by much
+               int numParticles = pw.Bodies.Length;
+
+               NativeStream particleInteractions = new NativeStream(numParticles, Allocator.TempJob);
+
+               // Job to evaluate kernel across and push into native queues
+               // Try Get sim.StepContext.PhasedDispatchPais with reflection
+               // This is an internal array in the physics system of object pairs from the broadphase.
+               // We need this array to distribute processing of pairs across threads
+               // What we are doing is essentially an IBodyPairsJob, but multithreaded
+               // It is too bad there is no interface for this in Physics
+               var stepContextFieldInfo = sim.GetType().GetField("StepContext", BindingFlags.NonPublic | BindingFlags.Instance);
+               var stepContext = stepContextFieldInfo.GetValue(sim);
+               var phasedDispatchPairsFieldInfo = stepContext.GetType().GetField("PhasedDispatchPairs", BindingFlags.Public | BindingFlags.Instance);
+               var phasedDispatchPairs = (NativeList<DispatchPairSequencer.DispatchPair>)phasedDispatchPairsFieldInfo.GetValue(stepContext);
+
+               // Also need the solver scheduler info so we can iterate over body pairs multithreaded (similar to solver)
+               var solverSchedulerInfoFieldInfo = stepContext.GetType().GetField("SolverSchedulerInfo", BindingFlags.Public | BindingFlags.Instance);
+               var SolverSchedulerInfo = typeof(DispatchPairSequencer).Assembly.GetType("SolverSchedulerInfo");
+               var solverSchedulerInfo = solverSchedulerInfoFieldInfo.GetValue(stepContext);
+               Type.DefaultBinder.ChangeType(solverSchedulerInfo, SolverSchedulerInfo, System.Globalization.CultureInfo.CurrentCulture);
+
+
+               var capturePairsTest = new InteractionPairsJob()
+               {
+                   phasedDispatchPairs = phasedDispatchPairs,
+                   bodies = pw.Bodies,
+                   smoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true), // RO access to particle smoothing size
+                   translationData = GetComponentDataFromEntity<Translation>(true),
+                   particleInteractionsWriter = particleInteractions.AsWriter(),
                 };
                 inputDeps = capturePairsTest.Schedule(phasedDispatchPairs, batchCount, inputDeps);
 
-                m_KernelDataSystem.AddJobHandleForProducer(inputDeps);
-
+               // Job to disable further physics calculation on our pairs
                 var disablePairs = new DisablePairsJob();
                 inputDeps = disablePairs.Schedule(sim, ref pw, inputDeps);
+
+               // Job to go over our particles and copy the appropriate queue of interactions into
+               // the dynamic buffers
+               var copyInteractionJob = new CopyInteractionJob()
+               {
+                   bodies = pw.Bodies,
+                   particleInteractionsReader = particleInteractions.AsReader(),
+                   bufferLookup = GetBufferFromEntity<ParticleInteraction>(),
+               };
+               inputDeps = copyInteractionJob.Schedule(numParticles, 1, inputDeps);
+
+               // Job to dispose all our queues
+               var disposeQueuesJob = new DisposeQueuesJob()
+               {
+                   particleInteractions = particleInteractions,
+               };
+               inputDeps = disposeQueuesJob.Schedule(inputDeps);
 
                 var scheduledJobHandle = JobHandle.CombineDependencies(inputDeps, Dependency);
                
@@ -230,7 +249,49 @@ public class KernelSystem : SystemBase, IParticleSystem
         }
     }
 
+    public struct CopyInteractionJob : IJobParallelFor
+    {
+        [ReadOnly]
+        public NativeArray<RigidBody> bodies;
 
+        [WriteOnly]
+        [NativeDisableParallelForRestriction]
+        public BufferFromEntity<ParticleInteraction> bufferLookup;
+
+        [ReadOnly]
+        public NativeStream.Reader particleInteractionsReader;
+
+        public void Execute(int index)
+        {
+            Entity e = bodies[index].Entity;
+
+            if (bufferLookup.HasComponent(e))
+            {
+                DynamicBuffer<ParticleInteraction> buffer = bufferLookup[e];
+
+                particleInteractionsReader.BeginForEachIndex(index);
+                
+                while ( particleInteractionsReader.RemainingItemCount > 0)
+                {
+                    ParticleInteraction element = particleInteractionsReader.Read<ParticleInteraction>();
+                    buffer.Add(element);
+                }
+
+                particleInteractionsReader.EndForEachIndex();
+            }
+        }
+    }
+
+    public struct DisposeQueuesJob : IJob
+    {
+        public NativeStream particleInteractions;
+
+        public void Execute()
+        {
+            particleInteractions.Dispose();
+        }
+    }
+    
     [BurstCompile]
     public struct InteractionPairsJob : IJobParallelForDefer
     {
@@ -247,7 +308,9 @@ public class KernelSystem : SystemBase, IParticleSystem
         public ComponentDataFromEntity<Translation> translationData;
 
         [WriteOnly]
-        public EntityCommandBuffer.ParallelWriter interactionDataWriter;
+        [NativeDisableParallelForRestriction]
+        public NativeStream.Writer particleInteractionsWriter;
+
 
         public void Execute(int index)
         {
@@ -277,6 +340,7 @@ public class KernelSystem : SystemBase, IParticleSystem
             float4 kernel_ij_j = SplineKernel.KernelAndGradienti(r_i, r_j, smoothingData[j].h);
             var kernel_ij_sym = (kernel_ij_i + kernel_ij_j) * 0.5f;
             var ij = new ParticleInteraction {
+                Self = i,
                 Other = j,
                 KernelThis = kernel_ij_i, 
                 KernelOther = kernel_ij_j, 
@@ -292,17 +356,13 @@ public class KernelSystem : SystemBase, IParticleSystem
             var kernel_ji_sym = (kernel_ji_i + kernel_ji_j) * 0.5f;
             var ji = new ParticleInteraction
             {
+                Self = j,
                 Other = i,
                 KernelThis = kernel_ji_j,
                 KernelOther = kernel_ji_i,
                 KernelSymmetric = kernel_ji_sym,
                 distance = distance,
             };
-
-            // Reuse index from global order of collisions for when we record into ecb
-            // This means we can only deal with 2^30 interactions max rather than 2^31 :(
-            int index_i = index << 1;
-            int index_j = index_i + 1;
 
             // Only insert to data structures later steps use for iteration if there's
             // a weight greater than zero for this pair. This saves every later calculation
@@ -311,10 +371,25 @@ public class KernelSystem : SystemBase, IParticleSystem
             {
                 // We're going to insert into the buffers of i and j a record represeting
                 // The symmetrized kernel contribution of the other one
-                interactionDataWriter.AppendToBuffer(index_i, i, ij);
-                interactionDataWriter.AppendToBuffer(index_j, j, ji);
+                
+                // Particle i
+                particleInteractionsWriter.BeginForEachIndex(dispatchPair.BodyIndexA);
+                particleInteractionsWriter.Write<ParticleInteraction>(ij);
+                particleInteractionsWriter.EndForEachIndex();
+                
+                // Particle j
+                particleInteractionsWriter.BeginForEachIndex(dispatchPair.BodyIndexB);
+                particleInteractionsWriter.Write<ParticleInteraction>(ji);
+                particleInteractionsWriter.EndForEachIndex();
             }
 #if RECORD_ALL_COLLISIONS
+            // TODO fixup Will need parallel queue system if particlequeuewriters works
+
+            // Reuse index from global order of collisions for when we record into ecb
+            // This means we can only deal with 2^30 interactions max rather than 2^31 :(
+            int index_i = index << 1;
+            int index_j = index_i + 1;
+
             interactionDataWriter.AppendToBuffer(index_i, i, new ParticleCollision { Other = j , distance = math.length(r_i - r_j) });
             interactionDataWriter.AppendToBuffer(index_j, j, new ParticleCollision { Other = i , distance = math.length(r_i - r_j) });
 #endif
