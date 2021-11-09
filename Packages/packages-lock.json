@@ -111,9 +111,9 @@
       "url": "https://packages.unity.com"
     },
     "com.unity.physics": {
-      "version": "0.6.0-preview.3",
+      "version": "file:../UpstreamPackages/com.unity.physics@0.6.0-preview.3",
       "depth": 0,
-      "source": "registry",
+      "source": "local",
       "dependencies": {
         "com.unity.burst": "1.4.1",
         "com.unity.collections": "0.15.0-preview.21",
@@ -124,8 +124,7 @@
         "com.unity.test-framework.performance": "2.3.1-preview",
         "com.unity.modules.imgui": "1.0.0",
         "com.unity.modules.jsonserialize": "1.0.0"
-      },
-      "url": "https://packages.unity.com"
+      }
     },
     "com.unity.platforms": {
       "version": "0.10.0-preview.10",
