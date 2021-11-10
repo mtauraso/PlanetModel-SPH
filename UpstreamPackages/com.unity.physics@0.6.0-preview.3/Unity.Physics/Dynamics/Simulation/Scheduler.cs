@@ -127,23 +127,23 @@ namespace Unity.Physics
         public struct SolverSchedulerInfo : IDisposable
         {
             // A structure which describes the number of items in a single phase
-            internal struct SolvePhaseInfo
+            public struct SolvePhaseInfo
             {
                 internal int DispatchPairCount; // The total number of pairs in this phase
                 internal int BatchSize; // The number of items per thread work item; at most, the number of pairs
-                internal int NumWorkItems; // The amount of "subtasks" of size BatchSize in this phase
-                internal int FirstWorkItemIndex; // The sum of NumWorkItems in all previous phases. Used for output native stream.
+                public int NumWorkItems; // The amount of "subtasks" of size BatchSize in this phase
+                public int FirstWorkItemIndex; // The sum of NumWorkItems in all previous phases. Used for output native stream.
                 internal int FirstDispatchPairIndex; // Index into the array of DispatchPairs for this phase.
             }
 
             [NoAlias]
-            internal NativeArray<SolvePhaseInfo> PhaseInfo;
+            public NativeArray<SolvePhaseInfo> PhaseInfo;
             [NoAlias]
             internal NativeArray<int> NumActivePhases;
             [NoAlias]
-            internal NativeArray<int> NumWorkItems;
+            public NativeArray<int> NumWorkItems;
 
-            internal int NumPhases => PhaseInfo.Length;
+            public int NumPhases => PhaseInfo.Length;
             internal static int CalculateNumWorkItems(NativeArray<SolvePhaseInfo> phaseInfos)
             {
                 int numWorkItems = 0;
@@ -169,7 +169,7 @@ namespace Unity.Physics
             }
 
             // For a given work item returns index into PhasedDispatchPairs and number of pairs to read.
-            internal int GetWorkItemReadOffset(int workItemIndex, out int pairReadCount)
+            public int GetWorkItemReadOffset(int workItemIndex, out int pairReadCount)
             {
                 SolvePhaseInfo phaseInfo = PhaseInfo[FindPhaseId(workItemIndex)];
 
