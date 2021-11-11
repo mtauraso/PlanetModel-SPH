@@ -195,6 +195,9 @@ namespace Unity.Physics
         // which informs how we can schedule the solver jobs and where they read info from.
         public DispatchPairSequencer.SolverSchedulerInfo SolverSchedulerInfo;
 
+        public NativeStream dynamicVsDynamicBodyPairs;
+        public NativeStream dynamicVsStaticBodyPairs;
+
         public NativeStream Contacts;
         public NativeStream Jacobians;
     }
@@ -333,14 +336,17 @@ namespace Unity.Physics
 
             // Find all body pairs that overlap in the broadphase
             var handles = input.World.CollisionWorld.ScheduleFindOverlapsJobs(
-                out NativeStream dynamicVsDynamicBodyPairs, out NativeStream dynamicVsStaticBodyPairs, handle, multiThreaded);
+                out StepContext.dynamicVsDynamicBodyPairs, out StepContext.dynamicVsStaticBodyPairs, handle, multiThreaded);
             handle = handles.FinalExecutionHandle;
             var disposeHandle1 = handles.FinalDisposeHandle;
             var postOverlapsHandle = handle;
 
+            // Earlier Callback so we can look at Broadphase output before it is sorted
+            handle = callbacks.Execute(SimulationCallbacks.Phase.PostBroadphase, this, ref input.World, handle);
+
             // Sort all overlapping and jointed body pairs into phases
             handles = m_Scheduler.ScheduleCreatePhasedDispatchPairsJob(
-                ref input.World, ref dynamicVsDynamicBodyPairs, ref dynamicVsStaticBodyPairs, handle,
+                ref input.World, ref StepContext.dynamicVsDynamicBodyPairs, ref StepContext.dynamicVsStaticBodyPairs, handle,
                 ref StepContext.PhasedDispatchPairs, out StepContext.SolverSchedulerInfo, multiThreaded);
             handle = handles.FinalExecutionHandle;
             var disposeHandle2 = handles.FinalDisposeHandle;
@@ -393,8 +399,8 @@ namespace Unity.Physics
             // Different dispose logic for single threaded simulation compared to "standard" threading (multi threaded)
             if (!multiThreaded)
             {
-                handle = dynamicVsDynamicBodyPairs.Dispose(handle);
-                handle = dynamicVsStaticBodyPairs.Dispose(handle);
+                handle = StepContext.dynamicVsDynamicBodyPairs.Dispose(handle);
+                handle = StepContext.dynamicVsStaticBodyPairs.Dispose(handle);
                 handle = StepContext.PhasedDispatchPairs.Dispose(handle);
                 handle = StepContext.Contacts.Dispose(handle);
                 handle = StepContext.Jacobians.Dispose(handle);

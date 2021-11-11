@@ -11,6 +11,7 @@ namespace Unity.Physics
         // Callbacks that are invoked after each simulation phase (no callback needed after last phase)
         public enum Phase
         {
+            PostBroadphase,
             PostCreateDispatchPairs,
             PostCreateContacts,
             PostCreateContactJacobians,
@@ -18,7 +19,7 @@ namespace Unity.Physics
         }
 
         // this needs to match the number of phase values above
-        private static readonly int k_NumCallbacks = 4;
+        private static readonly int k_NumCallbacks = 5;
 
         public delegate JobHandle Callback(ref ISimulation simulation, ref PhysicsWorld world, JobHandle inputDeps);
 
