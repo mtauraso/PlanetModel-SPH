@@ -151,28 +151,66 @@ public class KernelSystem : SystemBase, IParticleSystem
                 {
                     throw new NotImplementedException("SPH KernelSystem Only works with Unity Physics");
                 }
-                var stepContext = ((Simulation)sim).StepContext;
-                var dynamicVsDynamicBodyPairs = stepContext.dynamicVsDynamicBodyPairs;
+                var dynamicVsDynamicBodyPairs = ((Simulation)sim).StepContext.dynamicVsDynamicBodyPairs;
 
-                // TODO figure out some way to filter dynamicVsDynamicBody Pairs here
-                // The reason to filter is to avoid physics doing unnecessary downstream sorting
-                // work. We can't disable a pair this early, because collision pairs haven't
-                // yet been constructed.
+                // First filter this list such that we
+                // 1) Hand back to physics any pairs that are not SPH particles
+                // 2) Retain only SPH particles which have non-zero kernel interaction
 
-                // Flatten the dynamicVsDynamicPairs stream to a list
+                NativeArray<int> physicsPairsForEachCount0 = new NativeArray<int>(1, Allocator.TempJob);
+                var filterPairsPrePass = new StreamForEachCountJob()
+                {
+                    Stream = dynamicVsDynamicBodyPairs,
+                    ForEachCount0 = physicsPairsForEachCount0
+                };
+                inputDeps = filterPairsPrePass.Schedule(inputDeps);
+
+                // This stream goes back out to physics
+                // We do not dispose it, that will be Physics's job
+                NativeStream dynamicVsDynamicBodyPairsOut;
+                JobHandle dynamicVsDynamicBodyPairsOutHandle = NativeStream.ScheduleConstruct(
+                    out dynamicVsDynamicBodyPairsOut,
+                    physicsPairsForEachCount0, inputDeps, Allocator.TempJob);
+
+                // Put it where physics will find it
+                ((Simulation)sim).StepContext.dynamicVsDynamicBodyPairs = dynamicVsDynamicBodyPairsOut;
+
+                // This one id for us, and is destroyed at the end
+                NativeStream particleBodyPairsStream;
+                JobHandle particleBodyPairsStreamHandle = NativeStream.ScheduleConstruct(out particleBodyPairsStream,
+                    physicsPairsForEachCount0, inputDeps, Allocator.TempJob);
+
+                inputDeps = JobHandle.CombineDependencies(dynamicVsDynamicBodyPairsOutHandle, particleBodyPairsStreamHandle);
+
+                var filterPairs = new FilterPairs()
+                {
+                    // Input
+                    Bodies = pw.Bodies,
+                    TranslationData = GetComponentDataFromEntity<Translation>(true),
+                    SmoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true),
+                    DynamicVsDynamicPairs = dynamicVsDynamicBodyPairs,
+
+                    // Output
+                    PhysicsBodyPairsWriter = dynamicVsDynamicBodyPairsOut.AsWriter(),
+                    ParticleBodyPairsWriter = particleBodyPairsStream.AsWriter()
+                };
+
+                inputDeps = filterPairs.ScheduleUnsafeIndex0(physicsPairsForEachCount0, 1, inputDeps);
+
+                // Flatten the particle pairs stream down to a list, so we can sort and process
                 var unsortedPairs = new NativeList<DispatchPair>(Allocator.TempJob);
                 var elementOffsets = new NativeList<int>(Allocator.TempJob);
                 var prePass = new FlattenPairsPrePass()
                 {
-                    DynamicVsDynamicPairs = dynamicVsDynamicBodyPairs,
-                    ElementOffsets = elementOffsets,
+                    DynamicVsDynamicPairs = particleBodyPairsStream,
                     UnsortedPairs = unsortedPairs,
+                    ElementOffsets = elementOffsets,
                 };
                 inputDeps = prePass.Schedule(inputDeps);
 
                 var flattenPairs = new FlattenPairs()
                 {
-                    DynamicVsDynamicPairs = dynamicVsDynamicBodyPairs,
+                    DynamicVsDynamicPairs = particleBodyPairsStream,
                     ElementOffsets = elementOffsets,
                     UnsortedPairs = unsortedPairs,
                 };
@@ -193,7 +231,8 @@ public class KernelSystem : SystemBase, IParticleSystem
 
                 inputDeps = JobHandle.CombineDependencies(sortedByBodyAPairsHandle, sortedByBodyBPairsHandle);
 
-                // Once both are done calculate all the interactions
+                // Calculate all of the one-way kernel interactions, going through both arrays
+                // Multithreading is per-particle, so we can immediately write the particle's DynamicBuffer component
                 inputDeps = ScheduleCalculateInteractionJob(
                     ref sortedByBodyAPairs, ref sortedByBodyBPairs,
                     ref bodyAOffsets, ref bodyBOffsets, 
@@ -205,6 +244,13 @@ public class KernelSystem : SystemBase, IParticleSystem
 
                 // Schedule cleanup of data structures
                 // TODO parallelize this using Dispose handles pattern.
+
+                // We dispose this because we don't need it anymore and also physics doesn't need it
+                // Physics should only have the "out" pairs stream constructed during filtering
+                inputDeps = dynamicVsDynamicBodyPairs.Dispose(inputDeps);
+
+                inputDeps = physicsPairsForEachCount0.Dispose(inputDeps);
+                inputDeps = particleBodyPairsStream.Dispose(inputDeps);
                 inputDeps = unsortedPairs.Dispose(inputDeps);
                 inputDeps = elementOffsets.Dispose(inputDeps);
                 inputDeps = bodyAOffsets.Dispose(inputDeps);
@@ -212,35 +258,15 @@ public class KernelSystem : SystemBase, IParticleSystem
                 inputDeps = sortedByBodyAPairs.Dispose(inputDeps);
                 inputDeps = sortedByBodyBPairs.Dispose(inputDeps);
 
-                // How many body parirs do we have?
-                //var totalPairs = dynamicVsDynamicBodyPairs.Count();
-                //var workGroups = dynamicVsDynamicBodyPairs.ForEachCount;
-                //NativeList<BodyIndexPair> unsortedBodyPairs = new NativeList<BodyIndexPair>(totalPairs, Allocator.TempJob);
-
-                // Easy single-threaded way..?
-                // Turn dynamicVsDynamicBodyPairs into a flat array single-threaded
-                // Next Sort that array twice to body A array/Body B array using single-threaded radix sort
-                
-
-                // Basic algorithm:
-                // Make two sorted lists of dynamicVsdynamicBodyPairs. One is sort by body A, other is sort by body B.
-                // Use a radix sort on BodyIndexPair where the digits values are the rigid body indexes of the body
-                // we're sorting by
-                //
-                // For each sorted list generate batches, where each batch is (list, offset, length)
-                // and all pairs in a given batch have the same particle as the target of writes 
-                //
-                // Do batched iteration across these calculating kernels and saving to the dynamic pair 
-
                 var scheduledJobHandle = JobHandle.CombineDependencies(inputDeps, Dependency);
                 outputDependency = scheduledJobHandle;
                 return scheduledJobHandle;
             }, Dependency);
-#endif
-        m_StepPhysicsWorld.EnqueueCallback( SimulationCallbacks.Phase.PostCreateDispatchPairs,
+#else
+                m_StepPhysicsWorld.EnqueueCallback( SimulationCallbacks.Phase.PostCreateDispatchPairs,
             (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
             {
-#if false
+
                 // Throw if we can't have unity Physics, we rely on unity physics internal data structures
                 if (sim.Type != SimulationType.UnityPhysics)
                 {
@@ -266,22 +292,19 @@ public class KernelSystem : SystemBase, IParticleSystem
                     SolverSchedulerInfo = solverSchedulerInfo,
                 };
                 inputDeps = capturePairsTest.ScheduleUnsafeIndex0(numWorkItems, batchCount, inputDeps);
-#endif
                 // Job to disable further physics calculation on our pairs
                 var disablePairs = new DisablePairsJob();
                 inputDeps = disablePairs.Schedule(sim, ref pw, inputDeps);
-#if false
                 // Iterate multithreaded over m_interactions and copy to particle
                 // dynamic buffer components
                 inputDeps = ScheduleCopyInteractionJob(ref m_interactions, ref solverSchedulerInfo,
                     GetBufferFromEntity<ParticleInteraction>(), 
                     inputDeps);
-#endif
                 var scheduledJobHandle = JobHandle.CombineDependencies(inputDeps, Dependency);
                 outputDependency = scheduledJobHandle;
                 return scheduledJobHandle;
            }, Dependency);
-
+#endif
            updateNumber++;
     }
 
@@ -597,6 +620,7 @@ public class KernelSystem : SystemBase, IParticleSystem
     // Run over the For-Each index of the nativeStream counting elements
     // Put the cumulative element counts into an array
     [BurstCompile]
+    [NoAlias]
     public struct FlattenPairsPrePass : IJob
     {
         // Input
@@ -607,12 +631,14 @@ public class KernelSystem : SystemBase, IParticleSystem
         public NativeList<DispatchPair> UnsortedPairs;
 
         // Output
+        // Array offsets indexed by the foreach index of DynamicVsDynamicPairs
         public NativeList<int> ElementOffsets;
-
         
+
         public void Execute()
         {
             int forEachCount = DynamicVsDynamicPairs.ForEachCount;
+
             ElementOffsets.ResizeUninitialized(forEachCount);
             var reader = DynamicVsDynamicPairs.AsReader();
             int totalElements = 0;
@@ -623,6 +649,85 @@ public class KernelSystem : SystemBase, IParticleSystem
                 totalElements += reader.RemainingItemCount;
             }
             UnsortedPairs.ResizeUninitialized(totalElements);
+        }
+
+        public static unsafe bool StreamEq(ref NativeStream a, ref NativeStream b)
+        {
+            return UnsafeUtility.AddressOf(ref a) == UnsafeUtility.AddressOf(ref b);
+        }
+    }
+
+
+    // Counts the elements in NativeStream at job-time.
+    // Output is a single-element NativeArray that works with IJobParallelForDefer Scheduling functions
+    [BurstCompile]
+    public struct StreamForEachCountJob : IJob
+    {
+        // Input
+        [ReadOnly] public NativeStream Stream;
+        
+        // Output
+        public NativeArray<int> ForEachCount0;
+
+        public void Execute()
+        {
+            ForEachCount0[0] = Stream.ForEachCount;
+        }
+    }
+
+
+    // Assemble an array from the NativeStream
+    // Use the element counts to assemble the array in paralllel
+    // Each thread handles a single foreach index of the native stream
+    [BurstCompile]
+    public struct FilterPairs : IJobParallelForDefer
+    {
+        // Input
+        [ReadOnly] public NativeArray<RigidBody> Bodies;
+        [ReadOnly] public ComponentDataFromEntity<Translation> TranslationData;
+        [ReadOnly] public ComponentDataFromEntity<ParticleSmoothing> SmoothingData;
+        [ReadOnly] public NativeStream DynamicVsDynamicPairs;  // Stream is composed of BodyIndexPair only
+
+        // Output:
+        // These are streams of BodyIndexPair
+        public NativeStream.Writer PhysicsBodyPairsWriter; // Destined for Physics
+        public NativeStream.Writer ParticleBodyPairsWriter;  // Destined for further SPH processing
+
+        public void Execute(int forEachIndex)
+        {
+            var reader = DynamicVsDynamicPairs.AsReader();
+
+            reader.BeginForEachIndex(forEachIndex);
+            PhysicsBodyPairsWriter.BeginForEachIndex(forEachIndex);
+            ParticleBodyPairsWriter.BeginForEachIndex(forEachIndex);
+            while (reader.RemainingItemCount > 0)
+            {
+                BodyIndexPair bodyIndexPair = reader.Read<BodyIndexPair>();
+                Entity entityA = Bodies[bodyIndexPair.BodyIndexA].Entity;
+                Entity entityB = Bodies[bodyIndexPair.BodyIndexB].Entity;
+
+                if( SmoothingData.HasComponent(entityA) && SmoothingData.HasComponent(entityB))
+                {
+                    var r_i = TranslationData[entityA].Value;
+                    var r_j = TranslationData[entityB].Value;
+                    var h_i = SmoothingData[entityA].h;
+                    var h_j = SmoothingData[entityB].h;
+
+                    if (SplineKernel.Interacts(r_i, r_j, h_i, h_j))
+                    {
+                        // This particle has nonzero neighbor interaction
+                        ParticleBodyPairsWriter.Write(bodyIndexPair);
+                    }
+                } 
+                else 
+                {
+                    // Not ours, output to the list physics will consume
+                    PhysicsBodyPairsWriter.Write(bodyIndexPair);
+                }
+            }
+            ParticleBodyPairsWriter.EndForEachIndex();
+            PhysicsBodyPairsWriter.EndForEachIndex();
+            reader.EndForEachIndex();
         }
     }
 

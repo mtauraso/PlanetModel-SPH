@@ -1,6 +1,7 @@
 using UnityEngine;
 using Unity.Burst;
 using Unity.Mathematics;
+using Unity.Transforms;
 
 
 [BurstCompile]
@@ -45,6 +46,16 @@ static class SplineKernel
     // It should always be true that Kernel(Kappa()*h, h) = 0.0f because of compactness
     // TODO: learn to write tests in unity!
     static public float Kappa() => 2.0f;
+
+    // Return true if the particles could interact at either of the given smoothing lengths
+    static public bool Interacts(float3 r_i, float3 r_j, float size_i, float size_j)
+    {
+        float3 displacement = (r_i - r_j);
+        float distanceSq = math.dot(displacement, displacement);
+        return 
+            (distanceSq < size_i * size_i * Kappa() * Kappa()) || 
+            (distanceSq < size_j * size_j * Kappa() * Kappa());
+    }
 
     static public float Kernel(float distance, float size)
     {
