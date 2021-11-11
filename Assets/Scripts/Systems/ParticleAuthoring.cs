@@ -1,6 +1,3 @@
-//#define RECORD_ALL_COLLISIONS
-//#define KERNEL_SYSTEM_EXP
-// Also in KernelSystem
 using Unity.Collections;
 using Unity.Entities;
 using Unity.Jobs;
@@ -89,9 +86,6 @@ public class ParticleAuthoring : MonoBehaviour, IConvertGameObjectToEntity
         entityManager.AddComponentData(prototype, new ParticlePressure());
         entityManager.AddComponentData(prototype, new ParticlePressureGrad());
         entityManager.AddBuffer<ParticleInteraction>(prototype);
-#if RECORD_ALL_COLLISIONS
-        entityManager.AddBuffer<ParticleCollision>(prototype);
-#endif
 
         // TODO: Explicitly run this creation on the main thread, avoid the obfuscation of a job
         //       This is being done as a parallel-for job with an entity command buffer
