@@ -10,7 +10,7 @@ using Unity.Burst;
 
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
-[UpdateAfter(typeof(KernelDataSystem))]
+[UpdateAfter(typeof(StepPhysicsWorld))]
 [UpdateAfter(typeof(DensityFieldSystem))]
 public class PressureFieldSystem : SystemBase
 {

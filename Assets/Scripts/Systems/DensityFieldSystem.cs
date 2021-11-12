@@ -6,8 +6,8 @@ using Unity.Burst;
 
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
-[UpdateAfter(typeof(KernelDataSystem))]
-public class DensityFieldSystem : SystemBase, IParticleSystem
+[UpdateAfter(typeof(StepPhysicsWorld))]
+public class DensityFieldSystem : SystemBase, IPhysicsSystem
 {
     public void AddInputDependency(JobHandle jh)
     {
