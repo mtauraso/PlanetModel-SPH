@@ -10,7 +10,7 @@ using Unity.Collections;
 using Unity.Burst;
 using Unity.Collections.LowLevel.Unsafe;
 using static Unity.Physics.DispatchPairSequencer;
-using UnityEngine.Assertions;
+using Unity.Jobs.LowLevel.Unsafe;
 
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
@@ -100,7 +100,8 @@ public class KernelSystem : SystemBase, IPhysicsSystem
         m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostBroadphase,
             (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
             {
-                // A little paranoid since we're a custom callback that only exists in modified unity physics
+                // A little paranoid since we're attaching to a custom callback that only exists
+                // in modified unity physics
                 if (sim.Type != SimulationType.UnityPhysics)
                 {
                     throw new NotImplementedException("SPH KernelSystem Only works with Unity Physics");
@@ -120,16 +121,15 @@ public class KernelSystem : SystemBase, IPhysicsSystem
                 inputDeps = filterPairsPrePass.Schedule(inputDeps);
 
                 // This stream goes back out to physics
-                // We do not dispose it, that will be Physics's job
+                // We do not dispose, because Physics will.
                 NativeStream dynamicVsDynamicBodyPairsOut;
                 JobHandle dynamicVsDynamicBodyPairsOutHandle = NativeStream.ScheduleConstruct(
                     out dynamicVsDynamicBodyPairsOut,
                     physicsPairsForEachCount0, inputDeps, Allocator.TempJob);
 
-                // Put it where physics will find it
                 ((Simulation)sim).StepContext.dynamicVsDynamicBodyPairs = dynamicVsDynamicBodyPairsOut;
 
-                // This one id for us, and is destroyed at the end
+                // This stream is pairs we will process.
                 NativeStream particleBodyPairsStream;
                 JobHandle particleBodyPairsStreamHandle = NativeStream.ScheduleConstruct(out particleBodyPairsStream,
                     physicsPairsForEachCount0, inputDeps, Allocator.TempJob);
@@ -148,8 +148,13 @@ public class KernelSystem : SystemBase, IPhysicsSystem
                     PhysicsBodyPairsWriter = dynamicVsDynamicBodyPairsOut.AsWriter(),
                     ParticleBodyPairsWriter = particleBodyPairsStream.AsWriter()
                 };
-
                 inputDeps = filterPairs.ScheduleUnsafeIndex0(physicsPairsForEachCount0, 1, inputDeps);
+
+                // We dispose this because we don't need it anymore and also physics doesn't need it
+                // Physics should only have the dynamicVsDynamicBodyPairsOut stream constructed during 
+                // filtering
+                var disposeHandle1 = dynamicVsDynamicBodyPairs.Dispose(inputDeps);
+                var disposeHandle2 = physicsPairsForEachCount0.Dispose(inputDeps);
 
                 // Flatten the particle pairs stream down to a list, so we can sort and process
                 var unsortedPairs = new NativeList<DispatchPair>(Allocator.TempJob);
@@ -170,47 +175,56 @@ public class KernelSystem : SystemBase, IPhysicsSystem
                 };
                 inputDeps = flattenPairs.Schedule(elementOffsets, 1, inputDeps);
 
+                var disposeHandle3 = particleBodyPairsStream.Dispose(inputDeps);
+                var disposeHandle4 = elementOffsets.Dispose(inputDeps);
+                
                 // Now make two sorted lists one by bodyA the other by body B
                 int numBodies = pw.Bodies.Length;
-                Assert.AreNotEqual(numBodies, 0);
-                JobHandle sortedByBodyAPairsHandle = ScheduleSortPairsJob(true, unsortedPairs, numBodies,
+                SimulationJobHandles sortedByAHandles = ScheduleSortPairsJob(true, unsortedPairs, numBodies,
                     out NativeList<DispatchPair> sortedByBodyAPairs,
                     out NativeList<int> bodyAOffsets,
                     inputDeps);
 
-                JobHandle sortedByBodyBPairsHandle = ScheduleSortPairsJob(false, unsortedPairs, numBodies,
+                SimulationJobHandles sortedByBHandles = ScheduleSortPairsJob(false, unsortedPairs, numBodies,
                     out NativeList<DispatchPair> sortedByBodyBPairs,
                     out NativeList<int> bodyBOffsets,
                     inputDeps);
 
-                inputDeps = JobHandle.CombineDependencies(sortedByBodyAPairsHandle, sortedByBodyBPairsHandle);
-
+                inputDeps = JobHandle.CombineDependencies(sortedByAHandles.FinalExecutionHandle, 
+                    sortedByBHandles.FinalExecutionHandle);
+                var disposeHandle5 = JobHandle.CombineDependencies(sortedByAHandles.FinalDisposeHandle, 
+                    sortedByBHandles.FinalDisposeHandle);
+                
                 // Calculate all of the one-way kernel interactions, going through both arrays
-                // Multithreading is per-particle, so we can immediately write the particle's DynamicBuffer component
-                inputDeps = ScheduleCalculateInteractionJob(
-                    ref sortedByBodyAPairs, ref sortedByBodyBPairs,
-                    ref bodyAOffsets, ref bodyBOffsets,
-                    pw.Bodies,
-                    GetComponentDataFromEntity<ParticleSmoothing>(true),
-                    GetComponentDataFromEntity<Translation>(true),
-                    GetBufferFromEntity<ParticleInteraction>(),
-                    inputDeps);
+                // Multithreading is per-particle, so this job immediately writes the
+                // particle's DynamicBuffer component
+                var calculateInteractionJob = new CalculateInteractionJob
+                {
+                    SortedByBodyAPairs = sortedByBodyAPairs,
+                    SortedByBodyBPairs = sortedByBodyBPairs,
+                    BodyAOffsets = bodyAOffsets,
+                    BodyBOffsets = bodyBOffsets,
+                    Bodies = pw.Bodies,
+                    SmoothingData = GetComponentDataFromEntity<ParticleSmoothing>(true),
+                    TranslationData = GetComponentDataFromEntity<Translation>(true),
+                    BufferLookup = GetBufferFromEntity<ParticleInteraction>(),
+                };
+                inputDeps = calculateInteractionJob.Schedule(bodyAOffsets, 1, inputDeps);
 
-                // Schedule cleanup of data structures
-                // TODO parallelize this using Dispose handles pattern.
+                var disposeHandle6 = unsortedPairs.Dispose(inputDeps);
+                var disposeHandle7 = bodyAOffsets.Dispose(inputDeps);
+                var disposeHandle8 = bodyBOffsets.Dispose(inputDeps);
+                var disposeHandle9 = sortedByBodyAPairs.Dispose(inputDeps);
+                var disposeHandle10 = sortedByBodyBPairs.Dispose(inputDeps);
 
-                // We dispose this because we don't need it anymore and also physics doesn't need it
-                // Physics should only have the "out" pairs stream constructed during filtering
-                inputDeps = dynamicVsDynamicBodyPairs.Dispose(inputDeps);
+                JobHandle* deps = stackalloc JobHandle[10]
+                {
+                    disposeHandle1, disposeHandle2, disposeHandle3, disposeHandle4, disposeHandle5,
+                    disposeHandle6, disposeHandle7, disposeHandle8, disposeHandle9, disposeHandle10,
+                };
+                var finalDisposeHandle = JobHandleUnsafeUtility.CombineDependencies(deps, 10);
 
-                inputDeps = physicsPairsForEachCount0.Dispose(inputDeps);
-                inputDeps = particleBodyPairsStream.Dispose(inputDeps);
-                inputDeps = unsortedPairs.Dispose(inputDeps);
-                inputDeps = elementOffsets.Dispose(inputDeps);
-                inputDeps = bodyAOffsets.Dispose(inputDeps);
-                inputDeps = bodyBOffsets.Dispose(inputDeps);
-                inputDeps = sortedByBodyAPairs.Dispose(inputDeps);
-                inputDeps = sortedByBodyBPairs.Dispose(inputDeps);
+                inputDeps = JobHandle.CombineDependencies(inputDeps, finalDisposeHandle);
 
                 var scheduledJobHandle = JobHandle.CombineDependencies(inputDeps, Dependency);
                 outputDependency = scheduledJobHandle;
@@ -219,33 +233,7 @@ public class KernelSystem : SystemBase, IPhysicsSystem
         updateNumber++;
     }
 
-    #region Kernel Calculation
-    private JobHandle ScheduleCalculateInteractionJob(
-        ref NativeList<DispatchPair> sortedByBodyAPairs,
-        ref NativeList<DispatchPair> sortedByBodyBPairs,
-        ref NativeList<int> bodyAOffsets,
-        ref NativeList<int> bodyBOffsets,
-        NativeArray<RigidBody> bodies,
-        ComponentDataFromEntity<ParticleSmoothing> smoothingData,
-        ComponentDataFromEntity<Translation> translationData,
-        BufferFromEntity<ParticleInteraction> bufferLookup,
-
-        JobHandle handle)
-    {
-        var calculateInteractionJob = new CalculateInteractionJob
-        {
-            SortedByBodyAPairs = sortedByBodyAPairs,
-            SortedByBodyBPairs = sortedByBodyBPairs,
-            BodyAOffsets = bodyAOffsets,
-            BodyBOffsets = bodyBOffsets,
-            Bodies = bodies,
-            SmoothingData = smoothingData,
-            TranslationData = translationData,
-            BufferLookup = bufferLookup,
-        };
-        handle = calculateInteractionJob.Schedule(bodyAOffsets, 1, handle);
-        return handle;
-    }
+    #region Kernel Calculation Job
     [BurstCompile]
     public struct CalculateInteractionJob : IJobParallelForDefer
     {
@@ -263,11 +251,6 @@ public class KernelSystem : SystemBase, IPhysicsSystem
         public BufferFromEntity<ParticleInteraction> BufferLookup;
         public void Execute(int bodyIndex)
         {
-            Assert.AreEqual(BodyAOffsets.Length, Bodies.Length);
-            Assert.AreEqual(BodyBOffsets.Length, Bodies.Length);
-            Assert.AreNotEqual(Bodies.Length, 0);
-            Assert.AreEqual(SortedByBodyAPairs.Length, SortedByBodyBPairs.Length);
-            Assert.AreNotEqual(SortedByBodyAPairs.Length, 0);
             Entity i = Bodies[bodyIndex].Entity;
             if (!BufferLookup.HasComponent(i) ||
                 !SmoothingData.HasComponent(i) ||
@@ -356,12 +339,13 @@ public class KernelSystem : SystemBase, IPhysicsSystem
 #endregion
 
 #region Sorting
-    private static JobHandle ScheduleSortPairsJob(bool bodyAIsKey, NativeList<DispatchPair> unsortedPairs,
+    private static SimulationJobHandles ScheduleSortPairsJob(bool bodyAIsKey, NativeList<DispatchPair> unsortedPairs,
         int numBodies,
         out NativeList<DispatchPair> sortedPairs,
         out NativeList<int> bodyOffsets,
         JobHandle handle, bool singleThread = true)
     {
+        SimulationJobHandles handles = new SimulationJobHandles(handle);
         // TODO: Optimizations
         // - See if single thread radix sort (like in physics) is faster here.
         //   Downside... whole rest of paralllel algorithm is waiting on
@@ -372,9 +356,11 @@ public class KernelSystem : SystemBase, IPhysicsSystem
         bodyOffsets = new NativeList<int>(numBodies, Allocator.TempJob);
         var bodyLengths = new NativeArray<int>(numBodies, Allocator.TempJob);
 
+        JobHandle disposeHandle1 = default;
+        JobHandle disposeHandle2 = default;
+
         if (singleThread)
         {
-            Assert.AreNotEqual(numBodies, 0);
             var currentBodyOffsets = new NativeArray<int>(numBodies, Allocator.TempJob);
 
             var sortJobST = new SortPairsSTJob
@@ -389,7 +375,7 @@ public class KernelSystem : SystemBase, IPhysicsSystem
             };
             handle = sortJobST.Schedule(handle);
 
-            handle = currentBodyOffsets.Dispose(handle);
+            disposeHandle1 = currentBodyOffsets.Dispose(handle);
         }
         else
         {
@@ -417,9 +403,12 @@ public class KernelSystem : SystemBase, IPhysicsSystem
 
         // Side effect, our consumers wait on us finishing to dispose of our data
         // TODO look at SimulationJobHandles, there seems to be a solution pattern for this.
-        handle = bodyLengths.Dispose(handle);
+        disposeHandle2 = bodyLengths.Dispose(handle);
 
-        return handle;
+        handles.FinalExecutionHandle = handle;
+        handles.FinalDisposeHandle = JobHandle.CombineDependencies(disposeHandle1, disposeHandle2);
+
+        return handles;
     }
 
 
@@ -446,13 +435,8 @@ public class KernelSystem : SystemBase, IPhysicsSystem
             SortedPairs.ResizeUninitialized(UnsortedPairs.Length);
             BodyOffsets.ResizeUninitialized(NumBodies);
 
-            Assert.AreEqual(UnsortedPairs.Length, SortedPairs.Length);
-            Assert.AreEqual(NumBodies, BodyOffsets.Length);
 
-            // I think this is unnecessary to check because of a quirk in NativeArray
-            //Assert.AreEqual(NumBodies, BodyLengths.Length);
             // Count the bodies by index
-
             for (int i = 0; i < UnsortedPairs.Length; i++)
             {
                 var pair = UnsortedPairs[i];
@@ -481,7 +465,7 @@ public class KernelSystem : SystemBase, IPhysicsSystem
             }
         }
     }
-#region Multithreaded Sorting
+#region Multithreaded Sorting Jobs
     [BurstCompile]
     public struct SortPairsJob : IJobParallelForDefer
     {
@@ -556,7 +540,6 @@ public class KernelSystem : SystemBase, IPhysicsSystem
     // Run over the For-Each index of the nativeStream counting elements
     // Put the cumulative element counts into an array
     [BurstCompile]
-    [NoAlias]
     public struct FlattenPairsPrePass : IJob
     {
         // Input
