@@ -8,11 +8,10 @@ using Unity.Transforms;
 using Unity.Mathematics;
 using Unity.Collections;
 using Unity.Burst;
-using Unity.Collections.LowLevel.Unsafe;
 using static Unity.Physics.DispatchPairSequencer;
 using Unity.Jobs.LowLevel.Unsafe;
 
-[BurstCompile]
+[BurstCompile(OptimizeFor = OptimizeFor.Performance)]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
 [UpdateAfter(typeof(BuildPhysicsWorld))]
 [UpdateBefore(typeof(StepPhysicsWorld))]
@@ -234,7 +233,7 @@ public class KernelSystem : SystemBase, IPhysicsSystem
     }
 
     #region Kernel Calculation Job
-    [BurstCompile]
+    [BurstCompile(OptimizeFor = OptimizeFor.Performance, DisableSafetyChecks = true)]
     public struct CalculateInteractionJob : IJobParallelForDefer
     {
         // Inputs
@@ -357,7 +356,6 @@ public class KernelSystem : SystemBase, IPhysicsSystem
         var bodyLengths = new NativeArray<int>(numBodies, Allocator.TempJob);
 
         JobHandle disposeHandle1 = default;
-        JobHandle disposeHandle2 = default;
 
         if (singleThread)
         {
@@ -403,7 +401,7 @@ public class KernelSystem : SystemBase, IPhysicsSystem
 
         // Side effect, our consumers wait on us finishing to dispose of our data
         // TODO look at SimulationJobHandles, there seems to be a solution pattern for this.
-        disposeHandle2 = bodyLengths.Dispose(handle);
+        JobHandle disposeHandle2 = bodyLengths.Dispose(handle);
 
         handles.FinalExecutionHandle = handle;
         handles.FinalDisposeHandle = JobHandle.CombineDependencies(disposeHandle1, disposeHandle2);
@@ -412,7 +410,7 @@ public class KernelSystem : SystemBase, IPhysicsSystem
     }
 
 
-    [BurstCompile]
+    [BurstCompile(OptimizeFor = OptimizeFor.Performance, DisableSafetyChecks = false)]
     public struct SortPairsSTJob : IJob
     {
         // In
@@ -435,7 +433,6 @@ public class KernelSystem : SystemBase, IPhysicsSystem
             SortedPairs.ResizeUninitialized(UnsortedPairs.Length);
             BodyOffsets.ResizeUninitialized(NumBodies);
 
-
             // Count the bodies by index
             for (int i = 0; i < UnsortedPairs.Length; i++)
             {
@@ -444,17 +441,19 @@ public class KernelSystem : SystemBase, IPhysicsSystem
                 BodyLengths[bodyIndex] += 1;
             }
 
-            // Calculate offsets in a sorted array
-            int totalBodies = 0;
-            for (int i = 0; i < NumBodies; i++)
+            // Calculate start offsets for buckets
+            int prev = BodyLengths[0];
+            BodyOffsets[0] = 0;
+            CurrentBodyOffsets[0] = 0;
+            for (int i = 1; i < NumBodies; i++)
             {
-                BodyOffsets[i] = totalBodies;
-                CurrentBodyOffsets[i] = totalBodies;
-                totalBodies += BodyLengths[i];
+                int current = BodyLengths[i];
+                BodyOffsets[i] = BodyOffsets[i - 1] + prev;
+                CurrentBodyOffsets[i] = CurrentBodyOffsets[i - 1] + prev;
+                prev = current;
             }
 
             // Copy elements into buckets based on the appropriate index
-
             for (int i = 0; i < UnsortedPairs.Length; i++)
             {
                 DispatchPair pair = UnsortedPairs[i];
@@ -539,7 +538,7 @@ public class KernelSystem : SystemBase, IPhysicsSystem
 #region Flatten Filter Jobs
     // Run over the For-Each index of the nativeStream counting elements
     // Put the cumulative element counts into an array
-    [BurstCompile]
+    [BurstCompile(OptimizeFor = OptimizeFor.Performance)]
     public struct FlattenPairsPrePass : IJob
     {
         // Input
@@ -552,7 +551,6 @@ public class KernelSystem : SystemBase, IPhysicsSystem
         // Output
         // Array offsets indexed by the foreach index of DynamicVsDynamicPairs
         public NativeList<int> ElementOffsets;
-
 
         public void Execute()
         {
@@ -569,36 +567,22 @@ public class KernelSystem : SystemBase, IPhysicsSystem
             }
             UnsortedPairs.ResizeUninitialized(totalElements);
         }
-
-        public static unsafe bool StreamEq(ref NativeStream a, ref NativeStream b)
-        {
-            return UnsafeUtility.AddressOf(ref a) == UnsafeUtility.AddressOf(ref b);
-        }
     }
-
 
     // Counts the elements in NativeStream at job-time.
     // Output is a single-element NativeArray that works with IJobParallelForDefer Scheduling functions
     [BurstCompile]
     public struct StreamForEachCountJob : IJob
     {
-        // Input
-        [ReadOnly] public NativeStream Stream;
-
-        // Output
-        public NativeArray<int> ForEachCount0;
-
-        public void Execute()
-        {
-            ForEachCount0[0] = Stream.ForEachCount;
-        }
+        [ReadOnly] public NativeStream Stream;  // Input
+        public NativeArray<int> ForEachCount0; // Output
+        public void Execute() => ForEachCount0[0] = Stream.ForEachCount;
     }
-
 
     // Assemble an array from the NativeStream
     // Use the element counts to assemble the array in paralllel
     // Each thread handles a single foreach index of the native stream
-    [BurstCompile]
+    [BurstCompile(OptimizeFor = OptimizeFor.Performance, FloatPrecision = FloatPrecision.Low, DisableSafetyChecks = true)]
     public struct FilterPairs : IJobParallelForDefer
     {
         // Input
@@ -653,7 +637,7 @@ public class KernelSystem : SystemBase, IPhysicsSystem
     // Assemble an array from the NativeStream
     // Use the element counts to assemble the array in paralllel
     // Each thread handles a single foreach index of the native stream
-    [BurstCompile]
+    [BurstCompile(OptimizeFor = OptimizeFor.Performance)]
     public struct FlattenPairs : IJobParallelForDefer
     {
         // Input
