@@ -17,7 +17,7 @@ namespace Unity.Physics
     public struct CollisionWorld : ICollidable, IDisposable
     {
         [NoAlias] private NativeArray<RigidBody> m_Bodies;    // storage for all the rigid bodies
-        [NoAlias] internal Broadphase Broadphase;             // bounding volume hierarchies around subsets of the rigid bodies
+        [NoAlias] public Broadphase Broadphase;             // bounding volume hierarchies around subsets of the rigid bodies
         [NoAlias] internal NativeHashMap<Entity, int> EntityBodyIndexMap;
 
         public int NumBodies => Broadphase.NumStaticBodies + Broadphase.NumDynamicBodies;

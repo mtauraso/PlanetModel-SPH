@@ -1,12 +1,14 @@
 using Unity.Entities;
+using Unity.Physics;
 using Unity.Physics.Systems;
 using Unity.Mathematics;
 using Unity.Burst;
 using Unity.Jobs;
 using Unity.Transforms;
 using Unity.Collections;
-
-
+using System;
+using static Unity.Physics.Broadphase;
+using Unity.Jobs.LowLevel.Unsafe;
 
 // Update gravity field particle-by-particle
 // We are going to do this in a naive fashion for now
@@ -34,10 +36,33 @@ using Unity.Collections;
 // 
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
-[UpdateAfter(typeof(StepPhysicsWorld))]
+[UpdateAfter(typeof(BuildPhysicsWorld))]
+[UpdateBefore(typeof(StepPhysicsWorld))]
 public class GravityFieldSystem : SystemBase
 {
+    public const bool k_TreeGrav = false;
+
+    private StepPhysicsWorld m_StepPhysicsWorld;
+
+    protected override void OnCreate()
+    {
+        var world = World.DefaultGameObjectInjectionWorld;
+        m_StepPhysicsWorld = world.GetOrCreateSystem<StepPhysicsWorld>();
+    }
+
     protected override void OnUpdate()
+    {
+        if (k_TreeGrav) { 
+            OnUpdateTree();
+            OnUpdateNSquared();
+        } else { 
+            OnUpdateNSquared(); 
+        }
+    }
+
+
+
+    public void OnUpdateNSquared()
     {
         // Entity query that will give us only entities which have all three
         // we will eventually need ParticleSmoothing for variable smoothing lengths, but do not use it now.
@@ -49,10 +74,15 @@ public class GravityFieldSystem : SystemBase
 
         float gravConstant = 1.0f;
 
-        Entities.WithReadOnly(massData).WithReadOnly(translationData)
-            .WithReadOnly(entityDataLocal).WithDisposeOnCompletion(entityDataLocal)
-            .ForEach((Entity i, ref GravityField grav_i, // Should be write-only?
-                in ParticleSmoothing smoothing_i, in Translation translation_i ) => 
+        Entities
+            .WithReadOnly(massData)
+            .WithReadOnly(translationData)
+            .WithReadOnly(entityDataLocal)
+            .WithDisposeOnCompletion(entityDataLocal)
+            .ForEach((Entity i, 
+                ref GravityField grav_i, // Should be write-only?
+                in ParticleSmoothing smoothing_i, 
+                in Translation translation_i ) => 
             {
                 float4 gravity = float4.zero;
                 float3 r_i = translation_i.Value;
@@ -88,7 +118,9 @@ public class GravityFieldSystem : SystemBase
                         float x_5th = x_sq * x_cube;
                         grav_mag_over_r = (m / (a * a * a)) * (8.0f - 9.0f * x + 2.0f * x_cube);
                         grav_potential = -(m / a) *(2.4f - 4.0f * x_sq + 3.0f * x_cube - 0.4f*x_5th) ;
-                    } else {
+                    } 
+                    else 
+                    {
                         grav_mag_over_r = m / (r * r * r);
                         grav_potential = -(m / r);
                     }
@@ -99,5 +131,151 @@ public class GravityFieldSystem : SystemBase
 
                 grav_i.Value = gravity;
             }).ScheduleParallel();
+    }
+
+    public void OnUpdateTree()
+    {
+        m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostBroadphase,
+            (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
+            {
+                // A little paranoid since we're attaching to a custom callback that only exists
+                // in modified unity physics
+                if (sim.Type != SimulationType.UnityPhysics)
+                {
+                    throw new NotImplementedException("SPH KernelSystem Only works with Unity Physics");
+                }
+
+                // Get the tree!!
+                Tree BVH = pw.CollisionWorld.Broadphase.DynamicTree;
+                // bodies in broadphase are m_Bodies
+                // m_bodies is set up as [[dynamic bodies][Static bodies...]]
+                // 
+                // The dynamic tree is only over dynamic bodies, likewise for static
+                // Indicies in tree are within the sub-array, not overal bodies.
+                // For dynamic bodies these are the same indicies, since dynamic bodies are first
+                //
+                // Leaf processors receive indicies for the index space
+                //
+                // None of the collision/distance algorithms I'm seeing let one stop processing
+                // at a non-leaf node, they are all full traversals, so we need our own
+
+                NativeArray<GravitationalMoment> moments = new NativeArray<GravitationalMoment>(BVH.Nodes.Length, Allocator.TempJob);
+
+                // Annotate the tree with gravity
+                var GenerateMomentsSTJob = new GenerateMomentsSTJob
+                {
+                    // Inputs:
+                    ParticleTree = BVH,
+                    Bodies = pw.Bodies,
+                    MassData = GetComponentDataFromEntity<ParticleMass>(true),
+
+                    // Need a place to stick the moments
+                    Moments = moments,
+                };
+                inputDeps = GenerateMomentsSTJob.Schedule(inputDeps);
+
+                // Second things second, treewalk per particle
+                // First version: Walk the tree to leaves, evaluate at leaves
+                // Second version: Check intermediate nodes and use prior data
+                var particleGravityJob = Entities
+                //.WithReadOnly(BVH)
+                //.WithReadOnly(moments)
+                //.WithDisposeOnCompletion(moments)
+                .ForEach((
+                    ref GravityField gravityField, 
+                    in Translation translation, 
+                    in ParticleMass mass) =>
+                {
+                    // For this particle again do a depth-first treewalk
+                    // 
+                    // Push the top of BVH onto the stack
+                    //
+                    // Pop the stack, repeatedly until empty:
+                    //
+                    // If we are a leaf node:
+                    //   Compute the gravity contribution of the leaf node on the particle
+                    //   Add this to the running sums of grav potential and field strength
+                    //   Do not need entity here, just go from BVH Rigid body index -> Grav moment
+                    //      This will have the CM and mass of the particle
+                    //
+                    // If we are a non-leaf node:
+                    //   Look up our Gravitational moment to get CM
+                    //   Look up the Node AABB to get maximum extent
+                    //   Pass both to acceptance function
+                    //   If we accept the approximation of this node:
+                    //       Use grav moment to add to particle gravity contribution
+                    //
+                    //   If we do not accept the approximation of this node:
+                    //       Push this node's children only on to the stack for processing
+                    //
+                    // When we have exhausted the queue write out the particle gravity contribution
+                });
+                inputDeps = particleGravityJob.ScheduleParallel(inputDeps);
+
+                return inputDeps;
+            });
+    }
+
+    // A gravitational moment corresponding to mass in some bounding volume
+    //
+    // Stores the center of mass in world coordinates and
+    // the first moment (mass for point approximation)
+    // in a packed float4.
+    struct GravitationalMoment
+    {
+        public GravitationalMoment(float3 CM, float firstMoment)
+        {
+            m_packedCMfirstMoment = new float4(CM, firstMoment);
+        }
+        public float3 CenterOfMass
+        {
+            get => m_packedCMfirstMoment.xyz;
+        }
+        public float3 MonopoleMoment
+        {
+            get => m_packedCMfirstMoment.w;
+        }
+
+        private float4 m_packedCMfirstMoment;
+    }
+
+    // This is going to iterate the whole tree and add up moments for the relevant node
+    // For now Single Threaded:
+    //     If want to multithread: Look at CollisionWorld.cs, Broadphase.cs and BoundingVolumeHierarcy.cs for examples
+    //     May be possible to process queue in parallel, but it also may be slower to do it that way.
+    // TODO: Look at burst optimizations in other Unity.Physics tree code
+    [BurstCompile]
+    struct GenerateMomentsSTJob: IJob
+    {
+        // Input
+        [ReadOnly] public Tree ParticleTree;
+        [ReadOnly] public NativeArray<RigidBody> Bodies;
+        [ReadOnly] public ComponentDataFromEntity<ParticleMass> MassData;
+        
+        // Output
+        public NativeArray<GravitationalMoment> Moments;
+
+        public void Execute()
+        {
+            // Will need to walk the tree This is a depth-first traversal, doing this primarily to limit stack/queue length
+            //
+            // Push the root node of the tree on the stack
+            //
+            // If there are nodes on the stack, pop one
+            // For Leaves:
+            //  Lookup from rigid body index in tree -> entity -> Mass component data
+            //    (can we get speedup by pre-computing this lookup?)
+            //  Assemble relevant moments for this object at center-of mass for the leaf
+            //  Store themm in the appropriate spot in Moments array
+            //
+            // For Non-Leaves:
+            //  If All leaves have computed moments:
+            //     Calculate our moment from children's moments
+            //     Do so at a reference point that is center-of-mass to this volume
+            //     Store the moment and center-of-mass in the corresponding place in Moments array
+            //  If Some leaves have uncomputed moments:
+            //     Push ourselves and all uncomputed leaves on the stack 
+            //    
+        }
     }
 }
