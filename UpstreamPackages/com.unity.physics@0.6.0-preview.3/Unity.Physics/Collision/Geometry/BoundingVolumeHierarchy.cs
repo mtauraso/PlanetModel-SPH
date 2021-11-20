@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Unity.Collections;
@@ -10,8 +10,10 @@ namespace Unity.Physics
     // A 4-way bounding volume hierarchy
     public partial struct BoundingVolumeHierarchy
     {
-        private readonly unsafe Node* m_Nodes;
-        private readonly unsafe CollisionFilter* m_NodeFilters;
+        [NativeDisableUnsafePtrRestriction]
+        public readonly unsafe Node* m_Nodes;
+        [NativeDisableUnsafePtrRestriction]
+        public readonly unsafe CollisionFilter* m_NodeFilters;
 
         public unsafe Aabb Domain => m_Nodes[1].Bounds.GetCompoundAabb();
 

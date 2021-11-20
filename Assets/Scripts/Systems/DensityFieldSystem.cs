@@ -25,10 +25,15 @@ public class DensityFieldSystem : SystemBase, IPhysicsSystem
         var kernelSystem = World.GetExistingSystem<KernelSystem>();
         Dependency = JobHandle.CombineDependencies(kernelSystem.GetOutputDependency(), Dependency);
 
+        // NOTE: We should not need this dependency. It arises because both us and gravity field system
+        //       use mass data. I think the job system can't tell that everyone is only reading mass data
+        //       and that mass data is never written on a per-frame basis.
+        var gravityFieldSystem = World.GetExistingSystem<GravityFieldSystem>();
+        Dependency = JobHandle.CombineDependencies(gravityFieldSystem.GetOutputDependency(), Dependency);
+
         // RO access to particle mass data
         var massData = GetComponentDataFromEntity<ParticleMass>(true); 
         
-       
         // Update densities particle-by-particle
         Entities.WithReadOnly(massData).ForEach(( Entity i, 
                 ref ParticleDensity density_i, // Should be write-only
