@@ -31,15 +31,15 @@ Goals: Spherical mass simulation with components of hydrostatic equilibrium.
 ## Jupiter v2
 Goal: Achieve hydrostatic equilbrium with a jupiter-sized planet
 - ✅ Faster Kernel Calculation (6.5 ms for 3k particles)
-- 🟡Gravity in O(NlogN) using Physics system Tree
-  - May require surgury to Unity.Physics Broadphase
-  - Speedups on large number of particles
+- ✅ Gravity in O(NlogN) using Physics system Tree
+- 🟢 Gather data on gravity optimization
 - 🟡 Units & Scale
   - Allow choice of units/scale for internal calculations at compile time
   - Alter Authoring and physical data display to display with units
   - First version: 
     - Use CGS for I/O
-    - Define compile-time scales in space, time, mass for internal calc
+    - Define compile-time scales in space, time, mass for internal calc 
+- 🟠 Make gravity significantly faster at 3k - 10k particle regime
 - 🟠 Unit Tests for mathematics
   - Should be able to spot-test most math routines using Unity's testing system
 
