@@ -13,7 +13,7 @@ namespace Unity.Physics
 {
     // A bounding volume around a collection of rigid bodies
     [NoAlias]
-    internal struct Broadphase : IDisposable
+    public struct Broadphase : IDisposable
     {
         [NoAlias]
         private Tree m_StaticTree;  // The tree of static rigid bodies
