@@ -7,29 +7,22 @@ using Unity.Jobs;
 using Unity.Transforms;
 using Unity.Collections;
 using System;
-using static Unity.Physics.Broadphase;
-using Unity.Jobs.LowLevel.Unsafe;
 using static Unity.Physics.BoundingVolumeHierarchy;
 using Unity.Collections.LowLevel.Unsafe;
-using UnityEngine.Assertions;
-using UnityEngine;
 
-// Update gravity field particle-by-particle
-// We are going to do this in a naive fashion for now
-// - Go over every pair of SPH particles O(n^2)
-//   (Note: The NlogN way to do this involves tracking grav moments aligned with broadphase tree)
-// - Calculate distance in this function
-//   (Note: Could memoize the distances calculated in kernel function and use them here.
-//          Right now we duplicate math, but also don't depend on kernel system)
-
-// 
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
 [UpdateAfter(typeof(BuildPhysicsWorld))]
 [UpdateBefore(typeof(StepPhysicsWorld))]
 public class GravityFieldSystem : SystemBase, IPhysicsSystem
 {
-    public const bool k_TreeGrav = true;
+    public enum GravityImpl: ushort
+    {
+        GRAVITY_TREE_CPU, // O(N log N) Multipole algorithm based on Barnes-Hutt with a simple MAC
+        GRAVITY_PARTICLE_CPU, // O(N^2) Brute force gravity on CPU
+    };
+
+    public const GravityImpl k_GravityImpl = GravityImpl.GRAVITY_TREE_CPU;
     public const float k_GravConstant = 1.0f;
 
     private StepPhysicsWorld m_StepPhysicsWorld;
@@ -68,16 +61,21 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
 
     protected override void OnUpdate()
     {
-        if (k_TreeGrav) { 
-            OnUpdateTree();
-        } else { 
-            OnUpdateNSquaredCallback(); 
+        switch(k_GravityImpl)
+        {
+            case GravityImpl.GRAVITY_TREE_CPU:
+                OnUpdateTree();
+                break;
+            case GravityImpl.GRAVITY_PARTICLE_CPU:
+                OnUpdateParticle();
+                break;
         }
     }
 
     public void OnUpdateTree()
     {
         Cleanup();
+
         m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostBroadphase,
             (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
             {
@@ -172,7 +170,7 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
                             // Calculate its contribution to gravity and add that in.
                             if (AcceptApproximation(r_i, moment, node->Bounds.GetCompoundAabb()))
                             {
-                                gravity += GravityContributionMoment(r_i, moment);
+                                gravity += moment.GravityContribution(r_i);
                                 numApproximationsUsed++;
                             }
                             else if (node->IsLeaf)
@@ -230,9 +228,6 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
     public const float k_Theta = 0.7f;
     public static bool AcceptApproximation(float3 r_i, GravitationalMoment moment, Aabb boundingVolume)
     {
-#if false
-        return false;
-#else
         // Field point displacement
         float3 displacement = r_i - moment.CenterOfMass;
         float r_sq = math.dot(displacement, displacement);
@@ -249,14 +244,13 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         
         // Compare lengths avoiding sqrt
         return bmax_sq/r_sq < k_Theta*k_Theta;
-#endif
     }
 
-    public void OnUpdateNSquaredCallback()
+    public void OnUpdateParticle()
     {
         Cleanup();
 
-        m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostBroadphase,
+        m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostCreateDispatchPairs,
             (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
             {
                 // Entity query that will give us only entities which have all three
@@ -267,15 +261,13 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
                 var massData = GetComponentDataFromEntity<ParticleMass>(true);
                 var translationData = GetComponentDataFromEntity<Translation>(true);
 
-                //float gravConstant = 1.0f;
-
                 inputDeps = Entities
                     .WithReadOnly(massData)
                     .WithReadOnly(translationData)
                     .WithReadOnly(entityDataLocal)
                     .WithDisposeOnCompletion(entityDataLocal)
                     .ForEach((Entity i,
-                        ref GravityField grav_i, // Should be write-only?
+                        ref GravityField grav_i, // Should be write-only
                         in ParticleSmoothing smoothing_i,
                         in Translation translation_i) =>
                     {
@@ -310,59 +302,7 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
             });
     }
 
-#if false // Old N^2 gravity that doesn't play nice with job system.
-    public void OnUpdateNSquared()
-    {
-        // Entity query that will give us only entities which have all three
-        // we will eventually need ParticleSmoothing for variable smoothing lengths, but do not use it now.
-        var gravParticleQuery = GetEntityQuery(typeof(ParticleMass), typeof(ParticleSmoothing), typeof(Translation));
-
-        var entityDataLocal = gravParticleQuery.ToEntityArray(Allocator.TempJob);
-        var massData = GetComponentDataFromEntity<ParticleMass>(true);
-        var translationData = GetComponentDataFromEntity<Translation>(true);
-
-        //float gravConstant = 1.0f;
-
-        Entities
-            .WithReadOnly(massData)
-            .WithReadOnly(translationData)
-            .WithReadOnly(entityDataLocal)
-            .WithDisposeOnCompletion(entityDataLocal)
-            .ForEach((Entity i, 
-                ref GravityField grav_i, // Should be write-only?
-                in ParticleSmoothing smoothing_i, 
-                in Translation translation_i ) => 
-            {
-                float4 gravity = float4.zero;
-                float3 r_i = translation_i.Value;
-
-                // We're going to assume constant smoothing length for now
-                // TODO: Variable smoothing lengths. Options:
-                //       - Arbitrary symmetrization
-                //       - Dyer & Ip Uniform Density Sphere formula
-                //       - Switching to Price/Monaghan Kernel softening method
-                float a = smoothing_i.h;
-
-                foreach (Entity particle_j in entityDataLocal) 
-                {   
-                    // Skip self-contribution
-                    if (particle_j == i) 
-                    {
-                        // Todo: Add in self-contribution for potential?
-                        continue; 
-                    }
-
-                    float3 r_j = translationData[particle_j].Value;
-                    float m = massData[particle_j].Value;
-                    gravity += GravityContributionParticle(r_i, r_j, m, a);
-                }
-
-                grav_i.Value = gravity;
-            }).ScheduleParallel();
-    }
-#endif
-
-    // P2P calculation
+#region P2P Calculation
     // Returns a packed float4 with the gravitational contribution of point r_j with mass m on a point r_i
     // The packed float4 is xyz => Gradient of Gravitational potential, w => gravitational potential.
     // Inputs:
@@ -414,30 +354,9 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         float3 grav_potential_gradient = displacement * grav_mag_over_r;
         return new float4(k_GravConstant * grav_potential_gradient, k_GravConstant * grav_potential);
     }
+    #endregion
 
-    // M2P calculation
-    //
-    // Calculate the net gravitaitonal contribution of a GravitationalMoment structure on a field point r_i
-    // We do not bother with smoothing lengths for now because this assumed to be "far enough away" that
-    // smoothing length isn't an issue
-    // The packed float4 is xyz => Gradient of Gravitational potential, w => gravitational potential.
-    public static float4 GravityContributionMoment(float3 r_i, GravitationalMoment moment)
-    {
-        float3 displacement = r_i - moment.CenterOfMass;
-        float m = moment.MonopoleMoment;
-        float r = math.length(displacement);
-        float grav_mag_over_r;
-        float grav_potential;
-
-        grav_mag_over_r = m / (r * r * r);
-        grav_potential = -(m / r);
-
-        float3 grav_potential_gradient = displacement * grav_mag_over_r;
-
-        return new float4(k_GravConstant * grav_potential_gradient, k_GravConstant * grav_potential);
-    }
-
-    
+#region Moment Calculations (M2P, M2M, P2M)
     // A gravitational moment corresponding to mass in some bounding volume
     //
     // Stores the center of mass in world coordinates and
@@ -498,8 +417,34 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         {
             Accumulate(moment.CenterOfMass, moment.MonopoleMoment);
         }
+
+        
+        // M2P calculation
+        //
+        // Calculate the net gravitaitonal contribution of a GravitationalMoment structure on a field point r_i
+        // We do not bother with smoothing lengths for now because this assumed to be "far enough away" that
+        // smoothing length isn't an issue
+        // The packed float4 returned is xyz => Gradient of Gravitational potential, w => gravitational potential.
+        public float4 GravityContribution(float3 r_i)
+        {
+            float3 displacement = r_i - CenterOfMass;
+            float m = MonopoleMoment;
+            float r = math.length(displacement);
+            float grav_mag_over_r;
+            float grav_potential;
+
+            grav_mag_over_r = m / (r * r * r);
+            grav_potential = -(m / r);
+
+            float3 grav_potential_gradient = displacement * grav_mag_over_r;
+
+            return new float4(k_GravConstant * grav_potential_gradient, k_GravConstant * grav_potential);
+        }
     }
 
+    #endregion
+
+ #region Moment Job
     // This is going to iterate the whole tree and add up moments for the relevant node
     // For now Single Threaded:
     //     If want to multithread: Look at CollisionWorld.cs, Broadphase.cs and BoundingVolumeHierarcy.cs for examples
@@ -608,4 +553,5 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
             return retval;
         }
     }
+#endregion
 }
