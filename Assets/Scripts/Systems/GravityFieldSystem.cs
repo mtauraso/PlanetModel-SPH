@@ -9,6 +9,9 @@ using Unity.Collections;
 using System;
 using static Unity.Physics.BoundingVolumeHierarchy;
 using Unity.Collections.LowLevel.Unsafe;
+using UnityEngine;
+using UnityEngine.Rendering;
+using System.Threading;
 
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
@@ -20,12 +23,24 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
     {
         GRAVITY_TREE_CPU, // O(N log N) Multipole algorithm based on Barnes-Hutt with a simple MAC
         GRAVITY_PARTICLE_CPU, // O(N^2) Brute force gravity on CPU
+        GRAVITY_PARTICLE_GPU
     };
 
-    public const GravityImpl k_GravityImpl = GravityImpl.GRAVITY_TREE_CPU;
+    public const GravityImpl k_GravityImpl = GravityImpl.GRAVITY_PARTICLE_GPU;
     public const float k_GravConstant = 1.0f;
 
     private StepPhysicsWorld m_StepPhysicsWorld;
+
+    // Used for GPU Gravity
+    ComputeShader Shader = null;
+    int Kernel;
+    uint threadGroupSize;
+    public static ComputeBuffer resultBuffer;
+    public NativeArray<Vector4> output;
+    int vectorLength = 100;
+    public static GraphicsFence Fence;
+    public static AsyncGPUReadbackRequest AsyncRequest;
+    private static Semaphore gpuwait;
 
     // IPhysicsSystem interface
     // Output Dependency is what you wait on if you need our jobs to run before you
@@ -43,11 +58,24 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
 
         InputDependency = default;
         OutputDependency = default;
+        if(k_GravityImpl == GravityImpl.GRAVITY_PARTICLE_GPU)
+        {
+            Shader = Resources.Load<ComputeShader>("ParticleGravity");
+            Kernel = Shader.FindKernel("CSMain");
+            Shader.GetKernelThreadGroupSizes(Kernel, out threadGroupSize, out _, out _);
+            resultBuffer = new ComputeBuffer(vectorLength, sizeof(float) * 4);
+            gpuwait = new Semaphore(0, 1);
+            output = new NativeArray<Vector4>(vectorLength, Allocator.Persistent);
+        }
     }
 
     protected override void OnDestroy()
     {
         Cleanup();
+        if (k_GravityImpl == GravityImpl.GRAVITY_PARTICLE_GPU)
+        {
+            resultBuffer.Dispose();
+        }
     }
 
     protected void Cleanup()
@@ -69,8 +97,13 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
             case GravityImpl.GRAVITY_PARTICLE_CPU:
                 OnUpdateParticle();
                 break;
+            case GravityImpl.GRAVITY_PARTICLE_GPU:
+                OnUpdateParticleGPU();
+                break;
         }
     }
+
+
 
     public void OnUpdateTree()
     {
@@ -302,6 +335,57 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
             });
     }
 
+    public void OnUpdateParticleGPU()
+    {
+        Cleanup();
+
+        m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostCreateDispatchPairs,
+            (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
+            {
+                // Need to figure out how to pull this out of scheduling
+                // Perform at correct time when input data is available and up to date
+                // For now test data so we don't care
+                CommandBuffer commandBuffer = new CommandBuffer();
+
+                commandBuffer.SetExecutionFlags(CommandBufferExecutionFlags.AsyncCompute);
+                //Shader.SetBuffer(Kernel, "Result", resultBuffer);
+                commandBuffer.SetComputeBufferParam(Shader, Kernel, "Result", resultBuffer);
+                
+                int threadGroups = (int)((vectorLength + (threadGroupSize - 1)) / threadGroupSize);
+                // I think this tells the GPU to start. There is no input data to 
+                // write out to GPU yet
+                //Shader.Dispatch(Kernel, threadGroups, 1, 1);
+                commandBuffer.DispatchCompute(Shader, Kernel, threadGroups, 1, 1);
+
+                /*
+                GravityFieldSystem.Fence = commandBuffer.CreateGraphicsFence(
+                    GraphicsFenceType.AsyncQueueSynchronisation, 
+                    SynchronisationStageFlags.ComputeProcessing);
+                */
+                
+                Graphics.ExecuteCommandBufferAsync(commandBuffer, ComputeQueueType.Urgent);
+
+                Action<AsyncGPUReadbackRequest> gpuFinishedCallback = 
+                new Action<AsyncGPUReadbackRequest>((AsyncGPUReadbackRequest req) =>
+                {
+                    Debug.Log("Releasing semaphore");
+                    output = req.GetData<Vector4>();
+                    gpuwait.Release();
+                });
+
+                var collectJob = new CollectDataJob {
+                    output = output,
+                };
+                inputDeps = collectJob.Schedule(inputDeps);
+
+                AsyncRequest = AsyncGPUReadback.Request(resultBuffer, gpuFinishedCallback);
+                
+                //AsyncRequest = AsyncGPUReadback.RequestIntoNativeArray( ref output, resultBuffer, gpuFinishedCallback);
+
+                return inputDeps;
+            });
+    }
+
 #region P2P Calculation
     // Returns a packed float4 with the gravitational contribution of point r_j with mass m on a point r_i
     // The packed float4 is xyz => Gradient of Gravitational potential, w => gravitational potential.
@@ -444,7 +528,7 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
 
     #endregion
 
- #region Moment Job
+#region Moment Job
     // This is going to iterate the whole tree and add up moments for the relevant node
     // For now Single Threaded:
     //     If want to multithread: Look at CollisionWorld.cs, Broadphase.cs and BoundingVolumeHierarcy.cs for examples
@@ -551,6 +635,43 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
                 }
             }
             return retval;
+        }
+    }
+    #endregion
+
+#region  GPU Jobs
+
+    struct CollectDataJob : IJob
+    {
+        [ReadOnly]
+        public NativeArray<Vector4> output;
+        public void Execute()
+        {
+            // TODO: is there an API in Unity equivalent to vkWaitForFences
+            // Thats what is really wanted here.
+            // Thankfully, this is a worker thread so sleeping for a few ms should
+            // hopefully not impact overall efficiency by much if there are enough 
+            // workers to keep the CPU busy.
+            Debug.Log("Waiting on Semaphore");
+            TimeSpan timeout = new TimeSpan(0, 0, 1);
+            if (! gpuwait.WaitOne(timeout)) {
+                Debug.Log("Timed out waiting for GPU");
+                return;
+            }
+
+
+            // If we got here, data should be in the output buffer already
+
+            Debug.Log("Shader output first 5");
+            for (int i = 0; i < 5; i++)
+            {
+                Debug.Log(output[i]);
+            }
+            Debug.Log("Shader output last 5");
+            for (int i = output.Length - 5; i < output.Length; i++)
+            {
+                Debug.Log(output[i]);
+            }
         }
     }
 #endregion
