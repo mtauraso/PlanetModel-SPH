@@ -13,6 +13,18 @@ using UnityEngine;
 using UnityEngine.Rendering;
 using System.Threading;
 
+
+// How does this work with GPU:
+// All GPU access in unity appears to have to occur from the main thread.
+// There may be limited exceptions, but we're going to proceed on this assumption.
+//
+// It is difficult to sync with main thread explicitly
+//
+// GravityFieldSystem
+// Runs early in StepPhysics
+
+
+
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
 [UpdateAfter(typeof(BuildPhysicsWorld))]
@@ -30,17 +42,23 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
     public const float k_GravConstant = 1.0f;
 
     private StepPhysicsWorld m_StepPhysicsWorld;
+    private Thread mainThread;
 
     // Used for GPU Gravity
+    // How to find the shader object
     ComputeShader Shader = null;
     int Kernel;
+
+    // Group size for threading on GPU
     uint threadGroupSize;
-    public static ComputeBuffer resultBuffer;
-    public NativeArray<Vector4> output;
-    int vectorLength = 100;
-    public static GraphicsFence Fence;
-    public static AsyncGPUReadbackRequest AsyncRequest;
-    private static Semaphore gpuwait;
+
+    // GPU or shared memory for in/out to Gravity shader
+    private ComputeBuffer resultBuffer = null;
+    private ComputeBuffer inputBuffer = null;
+    public NativeArray<float3> input;
+    public float4 [] output;
+    private int numParticles;
+
 
     // IPhysicsSystem interface
     // Output Dependency is what you wait on if you need our jobs to run before you
@@ -60,12 +78,14 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         OutputDependency = default;
         if(k_GravityImpl == GravityImpl.GRAVITY_PARTICLE_GPU)
         {
+#if false
+            mainThread = Thread.CurrentThread;
+#endif
+
             Shader = Resources.Load<ComputeShader>("ParticleGravity");
             Kernel = Shader.FindKernel("CSMain");
             Shader.GetKernelThreadGroupSizes(Kernel, out threadGroupSize, out _, out _);
-            resultBuffer = new ComputeBuffer(vectorLength, sizeof(float) * 4);
-            gpuwait = new Semaphore(0, 1);
-            output = new NativeArray<Vector4>(vectorLength, Allocator.Persistent);
+            numParticles = 0;
         }
     }
 
@@ -75,6 +95,7 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         if (k_GravityImpl == GravityImpl.GRAVITY_PARTICLE_GPU)
         {
             resultBuffer.Dispose();
+            inputBuffer.Dispose();
         }
     }
 
@@ -83,6 +104,17 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         OutputDependency.Complete();
         InputDependency.Complete();
 
+        if (k_GravityImpl == GravityImpl.GRAVITY_PARTICLE_GPU)
+        {
+            if (inputBuffer != null && inputBuffer.IsValid())
+            {
+                inputBuffer.Dispose();
+            }
+            if (resultBuffer != null && resultBuffer.IsValid())
+            {
+                resultBuffer.Dispose();
+            }
+        }
         // reset our input dependency so we can start collecting for the next frame
         InputDependency = default;
     }
@@ -342,48 +374,153 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostCreateDispatchPairs,
             (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
             {
-                // Need to figure out how to pull this out of scheduling
-                // Perform at correct time when input data is available and up to date
-                // For now test data so we don't care
-                CommandBuffer commandBuffer = new CommandBuffer();
+                // GPU programming has to happen on the main thread
 
-                commandBuffer.SetExecutionFlags(CommandBufferExecutionFlags.AsyncCompute);
-                //Shader.SetBuffer(Kernel, "Result", resultBuffer);
-                commandBuffer.SetComputeBufferParam(Shader, Kernel, "Result", resultBuffer);
+                // We should (at schedule time) have current locations, masses, and smoothing
+                // because they are computed in the prior frame.
+
+                EntityQuery gravParticleQuery = GetEntityQuery(typeof(ParticleMass), typeof(ParticleSmoothing), typeof(Translation));
+                int currentParticles = gravParticleQuery.CalculateEntityCount();
+
                 
-                int threadGroups = (int)((vectorLength + (threadGroupSize - 1)) / threadGroupSize);
-                // I think this tells the GPU to start. There is no input data to 
-                // write out to GPU yet
-                //Shader.Dispatch(Kernel, threadGroups, 1, 1);
-                commandBuffer.DispatchCompute(Shader, Kernel, threadGroups, 1, 1);
+                if (currentParticles != numParticles && currentParticles != 0)
+                {
+                    numParticles = currentParticles;
+                    output = new float4[numParticles];
+                    /*
+                    inputBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3, ComputeBufferType.Default, ComputeBufferMode.Dynamic);
+                    resultBuffer = new ComputeBuffer(numParticles, sizeof(float) * 4, ComputeBufferType.Default, ComputeBufferMode.Dynamic);
+                    */
+                }
+                
+                inputBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3, ComputeBufferType.Default, ComputeBufferMode.Immutable);
+                resultBuffer = new ComputeBuffer(numParticles, sizeof(float) * 4, ComputeBufferType.Default, ComputeBufferMode.Immutable);
+                input = new NativeArray<float3>(currentParticles, Allocator.TempJob);
+
+                var indata = input;
+
+                var copyDataHandle = Entities
+                .ForEach((
+                    int entityInQueryIndex, Entity i,
+                    in ParticleMass mass_i,
+                    in ParticleSmoothing smoothing_i,
+                    in Translation translation_i
+                    ) => {
+                        // xcxc TODO: Other Inputs (Smoothing, Translation)
+                        indata[entityInQueryIndex] = translation_i.Value;
+                }).Schedule(default);
+
+                // Wait for input data to be done copying
+                copyDataHandle.Complete();
+
+                Debug.Log("Input Data" + input[0].ToString() + input[1].ToString() + input[2].ToString());
+
+                // Assemble a command buffer that will run our shader
+                int threadGroups = (int)((numParticles + (threadGroupSize - 1)) / threadGroupSize);
 
                 /*
+                CommandBuffer commandBuffer = new CommandBuffer();
+                commandBuffer.SetExecutionFlags(CommandBufferExecutionFlags.AsyncCompute);
+                commandBuffer.SetComputeBufferParam(Shader, Kernel, "Input", inputBuffer);
+                commandBuffer.SetComputeBufferParam(Shader, Kernel, "Result", resultBuffer);
+                commandBuffer.DispatchCompute(Shader, Kernel, threadGroups, 1, 1);
+                /* Do we need a fence, when we cannot really wait on the fence..?
                 GravityFieldSystem.Fence = commandBuffer.CreateGraphicsFence(
                     GraphicsFenceType.AsyncQueueSynchronisation, 
                     SynchronisationStageFlags.ComputeProcessing);
-                */
-                
-                Graphics.ExecuteCommandBufferAsync(commandBuffer, ComputeQueueType.Urgent);
+                 */
 
-                Action<AsyncGPUReadbackRequest> gpuFinishedCallback = 
-                new Action<AsyncGPUReadbackRequest>((AsyncGPUReadbackRequest req) =>
-                {
-                    Debug.Log("Releasing semaphore");
-                    output = req.GetData<Vector4>();
-                    gpuwait.Release();
-                });
 
-                var collectJob = new CollectDataJob {
-                    output = output,
-                };
-                inputDeps = collectJob.Schedule(inputDeps);
 
-                AsyncRequest = AsyncGPUReadback.Request(resultBuffer, gpuFinishedCallback);
-                
-                //AsyncRequest = AsyncGPUReadback.RequestIntoNativeArray( ref output, resultBuffer, gpuFinishedCallback);
+                // Move data to GPU buffer
+                // TODO: Can this be in a job too?
+                inputBuffer.SetData<float3>(input);
 
+                Shader.SetBuffer(Kernel, "Result", resultBuffer);
+                //Shader.SetBuffer(Kernel, "Input", inputBuffer);
+                Shader.Dispatch(Kernel, threadGroups, 1, 1);
+
+                // Actually trigger the GPU to begin.
+                //Graphics.ExecuteCommandBufferAsync(commandBuffer, ComputeQueueType.Urgent);
+
+                EnsureFieldComputationComplete();
+
+                // Dispose of input sometime later
+                inputDeps = input.Dispose(inputDeps);
+
+                OutputDependency = inputDeps;
                 return inputDeps;
             });
+    }
+
+    // Called by consumers who need gravity field system results
+    // This has to be called on the main thread, because it does GPU
+    // synchronization.
+    //
+    // This is a blocking wait for the GPU to be done with the gravity
+    // compute task.
+    //
+    // After this function runs, all GravityField components should be up to date
+    public unsafe void EnsureFieldComputationComplete()
+    {
+#if false
+        if (!Thread.CurrentThread.Equals(mainThread))
+        {
+            throw new Exception("EnsureFieldComputationComplete called off the main thread");
+        }
+#endif
+
+        // Ensure all our CPU jobs completed
+        OutputDependency.Complete();
+
+        if (k_GravityImpl == GravityImpl.GRAVITY_PARTICLE_GPU)
+        {
+
+            if (numParticles == 0)
+            {
+                return;
+            }
+
+            if (output.Length == 0)
+            {
+                Debug.Log("Output has length zero");
+                return;
+            }
+
+            // Naive way:
+            // GetData on the output buffer (Blocks until have data)
+            
+            //resultBuffer.GetData(output.ToArray());
+            resultBuffer.GetData(output);
+
+            fixed (void* outptr = output)
+            {
+                //var outputdata = NativeArrayUnsafeUtility.ConvertExistingDataToNativeArray<float4>(outptr, numParticles, Allocator.TempJob);
+                var outputdata = new NativeArray<float4>(output, Allocator.TempJob);
+
+                // Debug Log to see we got it
+                //Debug.Log("My output Data" + myoutput[0].ToString() + myoutput[1].ToString() + myoutput[2].ToString());
+                Debug.Log("output Data" + output[0].ToString() + output[1].ToString() + output[2].ToString());
+
+                // Let us hope to god Complete() hides a yield, and that unity does a good thing when we schedule like this
+                // GetData *needs* a system array, cannot deal with native array
+                // This needs a value type which a system array is not
+                // Maybe some other way to do this same process with the output? ... without adding another copy? System.Array -> Native array -> job?
+                // Does System.Array->NativeArray perform a copy..?
+                JobHandle copyDataHandle = Entities
+                    .WithAll<ParticleSmoothing, ParticleMass, Translation>()
+                    .WithDisposeOnCompletion(outputdata)
+                    .ForEach((
+                        int entityInQueryIndex,
+                        ref GravityField gravity_i
+                        ) => 
+                    { 
+                        gravity_i.Value = outputdata[entityInQueryIndex];
+                    }).Schedule(default);
+
+                copyDataHandle.Complete();
+            }
+        }
     }
 
 #region P2P Calculation
@@ -438,7 +575,7 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         float3 grav_potential_gradient = displacement * grav_mag_over_r;
         return new float4(k_GravConstant * grav_potential_gradient, k_GravConstant * grav_potential);
     }
-    #endregion
+#endregion
 
 #region Moment Calculations (M2P, M2M, P2M)
     // A gravitational moment corresponding to mass in some bounding volume
@@ -526,7 +663,7 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         }
     }
 
-    #endregion
+#endregion
 
 #region Moment Job
     // This is going to iterate the whole tree and add up moments for the relevant node
@@ -637,7 +774,7 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
             return retval;
         }
     }
-    #endregion
+#endregion
 
 #region  GPU Jobs
 
@@ -654,10 +791,12 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
             // workers to keep the CPU busy.
             Debug.Log("Waiting on Semaphore");
             TimeSpan timeout = new TimeSpan(0, 0, 1);
+            /*
             if (! gpuwait.WaitOne(timeout)) {
                 Debug.Log("Timed out waiting for GPU");
                 return;
             }
+            */
 
 
             // If we got here, data should be in the output buffer already

@@ -1,6 +1,8 @@
 // Each #kernel tells which function to compile; you can have many kernels
 #pragma kernel CSMain
 
+// StructuredBuffer<float3> Input;
+
 // Create a RenderTexture with enableRandomWrite flag and set it
 // with cs.SetTexture
 RWStructuredBuffer<float4> Result;
@@ -9,6 +11,8 @@ RWStructuredBuffer<float4> Result;
 void CSMain (uint3 id : SV_DispatchThreadID)
 {
     // TODO: insert actual code here!
-    Result[id.x] = float4(id.x+5, 0, 0, 0);
+    // For now copy input to output with a zero in the final position.
+    Result[id.x] = float4(id.x, 0, 0, 0);
+    //Result[id.x] = float4(Input[id.x].x, Input[id.x].y, Input[id.x].z, 0);
     //Result[id.xy] = float4(id.x & id.y, (id.x & 15)/15.0, (id.y & 15)/15.0, 0.0);
 }

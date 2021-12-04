@@ -12,7 +12,7 @@ using Unity.Transforms;
 // Updating smoothing length for next timestep (and all the places it is cached!)
 [BurstCompile]
 [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
-[UpdateBefore(typeof(BuildPhysicsWorld))]
+[UpdateAfter(typeof(ExportPhysicsWorld))]
 public class ParticleSmoothingSystem : SystemBase
 {
     public const float TARGET_NEIGHBORS = 50;
