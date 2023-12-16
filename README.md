@@ -1,5 +1,5 @@
 # PlanetModel-SPH
-Hobby project to implement SPH in Unity targeting real-time physically-reasonable simulation of Planets and Stars on a gaming laptop using Unity.
+Self study to implement SPH in Unity targeting real-time physically-reasonable simulation of Planets and Stars on a gaming laptop using Unity.
 
 # Setup notes
 Needs unity 2021.1.23f1
