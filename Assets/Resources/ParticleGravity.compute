@@ -1,18 +1,173 @@
 // Each #kernel tells which function to compile; you can have many kernels
 #pragma kernel CSMain
 
-// StructuredBuffer<float3> Input;
+// Defining what input we get from CPU
+struct GravityParticle {
+    float3 Position;
+    float Smoothing;
+    float Mass;
+};
+StructuredBuffer<GravityParticle> ParticleBuffer;
 
-// Create a RenderTexture with enableRandomWrite flag and set it
-// with cs.SetTexture
-RWStructuredBuffer<float4> Result;
 
-[numthreads(64,1,1)]
+struct GravityField {
+    float3 FieldVector; // -grad(Phi)
+    float Phi;
+};
+RWStructuredBuffer<GravityField> ResultBuffer;
+
+// TODO pass this in at some point
+static const float k_GravConstant = 1.0f; 
+
+// Number of threads in a group and also number of particles processed at once
+#define TILE_SIZE 8
+
+// Shared location for the particles being processed sequentially by the current thread group
+groupshared GravityParticle Particles_j[TILE_SIZE];
+
+
+// Returns a packed float4 with the gravitational contribution of point r_j with mass m on a point r_i
+// The packed float4 is xyz => Gradient of Gravitational potential, w => gravitational potential.
+// Inputs:
+// r_i -> float3 world position of field point
+// r_j -> float3 world position of point particle
+// m -> mass of point particle
+// a -> Smoothing constant for close-in approximation
+//
+// About the calculation:
+// - Use a uniform-density model for the particles, with their smaller smoothing length "h" as the characteristic particle size a
+//   The force law is Equation 8 from "Softening in N-body Simulations of CollisionLes systems" (1993, Dyer & Ip)
+//
+// - Note: This choice of model means we don't use the output of the density system
+//
+//   Force law for r >= a:
+//   |F_grav| = (G*M*M)/(r^2)
+//
+//   Force law for r <= a:
+//   x = r/a
+//   |F_grav| = ((G*M*M*x)/(a^2))*(8 - 9x + 2x^3)
+//
+// - Store the gravity field vector g, and the gravitational potential phi
+// - Some assumptions we use now:
+//    G = 1
+//    F_grav(vec) = m * g(vector)
+//    - Gradient(phi) = g(vector)
+float4 CalculateParticleInteraction(float3 r_i, float3 r_j, float m, float a) {
+    float3 displacement = r_i - r_j;
+    float r = sqrt(dot(displacement, displacement));
+    float grav_mag_over_r;
+    float grav_potential;
+
+    if (r < a)
+    {
+        float x = r / a;
+        float x_sq = x * x;
+        float x_cube = x_sq * x;
+        float x_5th = x_sq * x_cube;
+        grav_mag_over_r = (m / (a * a * a)) * (8.0f - 9.0f * x + 2.0f * x_cube);
+        grav_potential = -(m / a) * (2.4f - 4.0f * x_sq + 3.0f * x_cube - 0.4f * x_5th);
+    }
+    else
+    {
+        grav_mag_over_r = m / (r * r * r);
+        grav_potential = -(m / r);
+    }
+
+    float3 grav_potential_gradient = displacement * grav_mag_over_r;
+
+    return k_GravConstant * float4(grav_potential_gradient.x, grav_potential_gradient.y, grav_potential_gradient.z, grav_potential);
+}
+
+// Tile Calculation
+// For our particle i, accumulate point iteractions with particles j
+float4 CalculateTile(float3 r_i, float smooth) {
+    float4 grav = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int j = 0; j < TILE_SIZE; j++) {
+
+        float3 r_j = Particles_j[j].Position;
+        float mass_j = Particles_j[j].Mass;
+
+        grav += CalculateParticleInteraction(r_i, r_j, mass_j, smooth);
+    }
+    return grav;
+}
+
+
+
+
+
+[numthreads(TILE_SIZE, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupThreadID)
+{
+    uint N, stride;
+    ParticleBuffer.GetDimensions(N, stride);
+
+    // Load our particle
+    float3 r_i = ParticleBuffer[id.x].Position;
+    float smooth = ParticleBuffer[id.x].Smoothing;
+
+    float4 FieldAccum = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // Iterate by tile size
+    for (uint i = 0; i < N; i += TILE_SIZE) {
+
+        // Load a single particle_j into shared memory
+        Particles_j[gid.x] = ParticleBuffer[i + gid.x];
+
+        // Sync so all groups have loaded particles j for the upcoming tile
+        GroupMemoryBarrierWithGroupSync();
+
+        // Accumulate field & potential for particles in this tile
+        FieldAccum += CalculateTile(r_i, smooth);
+
+        // Wait for everyone before loading next tile
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Save off our accumulated field for output to CPU
+    ResultBuffer[id.x].FieldVector = FieldAccum.xyz;
+    ResultBuffer[id.x].Phi = FieldAccum.w;
+}
+
+
+
+// Outline:
+// Shared memory locations
+// Particle i (p particles per thread group)
+// Particle j (p particles per thread group)
+// Field/phi infos  (p infos per thread group)
+
+
+//Do Calculation
+//  - Load the i particle from global -> shared mem
+// Loop:
+//  - Load one j particle for this batch from global -> shared mem (other threads will load the others in the batch)
+//    Should be batch start plus our ID within the group
+//  * Sync point for shared memory access*
+//  - Calculate the interaction for all particles j on our particle i
+//  - Accumulate in shared memory
+//  - *Sync point*
+
+
+/*
 void CSMain (uint3 id : SV_DispatchThreadID)
 {
     // TODO: insert actual code here!
     // For now copy input to output with a zero in the final position.
-    Result[id.x] = float4(id.x, 0, 0, 0);
+    //Result[id.x] = float4(id.x, 0, 0, 0);
     //Result[id.x] = float4(Input[id.x].x, Input[id.x].y, Input[id.x].z, 0);
+
+
+    ResultBuffer[id.x].FieldVector = ParticleBuffer[id.x].Position;
+    ResultBuffer[id.x].Phi = ParticleBuffer[id.x].Smoothing;
+    //ResultBuffer[id.x].FieldVector = float3(1+(id.x*10), 2+(id.x * 10), 3+(id.x * 10));
+    //ResultBuffer[id.x].Phi = 4 + (id.x*10);
+
+
+    //ResultBuffer[id.x].Phi = ParticleBuffer[id.x].Smoothing;
     //Result[id.xy] = float4(id.x & id.y, (id.x & 15)/15.0, (id.y & 15)/15.0, 0.0);
+
+
+
 }
+*/

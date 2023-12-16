@@ -12,6 +12,7 @@ using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 using UnityEngine.Rendering;
 using System.Threading;
+using System.Runtime.InteropServices;
 
 
 // How does this work with GPU:
@@ -22,6 +23,8 @@ using System.Threading;
 //
 // GravityFieldSystem
 // Runs early in StepPhysics
+
+
 
 
 
@@ -38,25 +41,63 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         GRAVITY_PARTICLE_GPU
     };
 
-    public const GravityImpl k_GravityImpl = GravityImpl.GRAVITY_PARTICLE_GPU;
+    public const GravityImpl k_GravityImpl = GravityImpl.GRAVITY_PARTICLE_CPU;
     public const float k_GravConstant = 1.0f;
 
     private StepPhysicsWorld m_StepPhysicsWorld;
     private Thread mainThread;
 
-    // Used for GPU Gravity
-    // How to find the shader object
+    // GPU Gravity variables
+
+    // Shader Tracking
     ComputeShader Shader = null;
     int Kernel;
-
-    // Group size for threading on GPU
     uint threadGroupSize;
 
-    // GPU or shared memory for in/out to Gravity shader
-    private ComputeBuffer resultBuffer = null;
-    private ComputeBuffer inputBuffer = null;
-    public NativeArray<float3> input;
-    public float4 [] output;
+    // Shader Types
+    // See here for layout rules: https://github.com/microsoft/DirectXShaderCompiler/wiki/Buffer-Packing
+    // Note by virtue of being HLSL Structured Buffers these are not subject to the "Legacy" rules on that page
+    [StructLayout(LayoutKind.Explicit, Size = 20)]
+    struct GPUGravityParticle
+    {
+        [FieldOffset(0)]
+        public float3 Position;
+
+        [FieldOffset(12)]
+        public float Smoothing;
+
+        [FieldOffset(16)]
+        public float Mass;
+
+        public override string ToString() => 
+            "{"+
+            " Pos: " + Position.ToString() + 
+            " Smooth: " + Smoothing.ToString() + 
+            " Mass: " + Mass.ToString() + 
+            " }";
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 16)]
+    struct GPUGravityField
+    {
+        [FieldOffset(0)]
+        public float3 FieldVector;
+
+        [FieldOffset(12)]
+        public float Phi;
+
+        public override string ToString() => 
+            "{"+
+            " Field: " + FieldVector.ToString() + 
+            " Phi: " + Phi.ToString() +
+            " }";
+    }
+
+    // Buffers and sizes
+    private ComputeBuffer ResultBuffer = null; // Type GPUGravityField
+    private ComputeBuffer ParticleBuffer = null;  // Type GPUGravityParticle
+    private NativeArray<GPUGravityParticle> ParticleArray;
+    private GPUGravityField [] FieldArray;
     private int numParticles;
 
 
@@ -94,8 +135,8 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
         Cleanup();
         if (k_GravityImpl == GravityImpl.GRAVITY_PARTICLE_GPU)
         {
-            resultBuffer.Dispose();
-            inputBuffer.Dispose();
+            ResultBuffer.Dispose();
+            ParticleBuffer.Dispose();
         }
     }
 
@@ -106,13 +147,13 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
 
         if (k_GravityImpl == GravityImpl.GRAVITY_PARTICLE_GPU)
         {
-            if (inputBuffer != null && inputBuffer.IsValid())
+            if (ParticleBuffer != null && ParticleBuffer.IsValid())
             {
-                inputBuffer.Dispose();
+                ParticleBuffer.Dispose();
             }
-            if (resultBuffer != null && resultBuffer.IsValid())
+            if (ResultBuffer != null && ResultBuffer.IsValid())
             {
-                resultBuffer.Dispose();
+                ResultBuffer.Dispose();
             }
         }
         // reset our input dependency so we can start collecting for the next frame
@@ -375,10 +416,10 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
             (ref ISimulation sim, ref PhysicsWorld pw, JobHandle inputDeps) =>
             {
                 // GPU programming has to happen on the main thread
-
                 // We should (at schedule time) have current locations, masses, and smoothing
-                // because they are computed in the prior frame.
+                // because they are computed in the prior frame, so we can use them without scheduling a job
 
+                // Adjust buffers and sizing if number of particles has changed since last frame.
                 EntityQuery gravParticleQuery = GetEntityQuery(typeof(ParticleMass), typeof(ParticleSmoothing), typeof(Translation));
                 int currentParticles = gravParticleQuery.CalculateEntityCount();
 
@@ -386,18 +427,28 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
                 if (currentParticles != numParticles && currentParticles != 0)
                 {
                     numParticles = currentParticles;
-                    output = new float4[numParticles];
-                    /*
-                    inputBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3, ComputeBufferType.Default, ComputeBufferMode.Dynamic);
-                    resultBuffer = new ComputeBuffer(numParticles, sizeof(float) * 4, ComputeBufferType.Default, ComputeBufferMode.Dynamic);
-                    */
+                    FieldArray = new GPUGravityField[numParticles];
                 }
                 
-                inputBuffer = new ComputeBuffer(numParticles, sizeof(float) * 3, ComputeBufferType.Default, ComputeBufferMode.Immutable);
-                resultBuffer = new ComputeBuffer(numParticles, sizeof(float) * 4, ComputeBufferType.Default, ComputeBufferMode.Immutable);
-                input = new NativeArray<float3>(currentParticles, Allocator.TempJob);
+                unsafe
+                {
+                    //Debug.Log("sizeof(GPUGravityParticle): " + sizeof(GPUGravityParticle));
+                    //Debug.Log("sizeof(GPUGravityField): " + sizeof(GPUGravityField));
 
-                var indata = input;
+                    ParticleBuffer = new ComputeBuffer(numParticles,
+                        sizeof(GPUGravityParticle),
+                        ComputeBufferType.Default, ComputeBufferMode.Immutable);
+                    ResultBuffer = new ComputeBuffer(numParticles,
+                        sizeof(GPUGravityField),
+                        ComputeBufferType.Default, ComputeBufferMode.Immutable);
+                }
+
+                ParticleArray = new NativeArray<GPUGravityParticle>(currentParticles, Allocator.TempJob);
+                int threadGroups = (int)((numParticles + (threadGroupSize - 1)) / threadGroupSize);
+
+
+                // Copy from ECS Components -> GPU staging area
+                var indata = ParticleArray;
 
                 var copyDataHandle = Entities
                 .ForEach((
@@ -406,18 +457,21 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
                     in ParticleSmoothing smoothing_i,
                     in Translation translation_i
                     ) => {
-                        // xcxc TODO: Other Inputs (Smoothing, Translation)
-                        indata[entityInQueryIndex] = translation_i.Value;
+                        var particle = new GPUGravityParticle()
+                        {
+                            Position = translation_i.Value,
+                            Mass = mass_i.Value,
+                            Smoothing = smoothing_i.h,
+                        };
+                        indata[entityInQueryIndex] = particle;
                 }).Schedule(default);
 
                 // Wait for input data to be done copying
                 copyDataHandle.Complete();
 
-                Debug.Log("Input Data" + input[0].ToString() + input[1].ToString() + input[2].ToString());
+                //Debug.Log("Input Data" + ParticleArray[0].ToString() + ParticleArray[1].ToString() + ParticleArray[2].ToString());
 
-                // Assemble a command buffer that will run our shader
-                int threadGroups = (int)((numParticles + (threadGroupSize - 1)) / threadGroupSize);
-
+                // Dispatch commands to the GPU
                 /*
                 CommandBuffer commandBuffer = new CommandBuffer();
                 commandBuffer.SetExecutionFlags(CommandBufferExecutionFlags.AsyncCompute);
@@ -430,23 +484,19 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
                     SynchronisationStageFlags.ComputeProcessing);
                  */
 
-
-
                 // Move data to GPU buffer
-                // TODO: Can this be in a job too?
-                inputBuffer.SetData<float3>(input);
+                // TODO: Can this also be in a job? Is there any benefit?
+                ParticleBuffer.SetData<GPUGravityParticle>(ParticleArray);
 
-                Shader.SetBuffer(Kernel, "Result", resultBuffer);
-                //Shader.SetBuffer(Kernel, "Input", inputBuffer);
+                Shader.SetBuffer(Kernel, "ResultBuffer", ResultBuffer);
+                Shader.SetBuffer(Kernel, "ParticleBuffer", ParticleBuffer);
                 Shader.Dispatch(Kernel, threadGroups, 1, 1);
 
                 // Actually trigger the GPU to begin.
                 //Graphics.ExecuteCommandBufferAsync(commandBuffer, ComputeQueueType.Urgent);
 
-                EnsureFieldComputationComplete();
-
                 // Dispose of input sometime later
-                inputDeps = input.Dispose(inputDeps);
+                inputDeps = ParticleArray.Dispose(inputDeps);
 
                 OutputDependency = inputDeps;
                 return inputDeps;
@@ -481,7 +531,7 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
                 return;
             }
 
-            if (output.Length == 0)
+            if (FieldArray.Length == 0)
             {
                 Debug.Log("Output has length zero");
                 return;
@@ -489,18 +539,15 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
 
             // Naive way:
             // GetData on the output buffer (Blocks until have data)
-            
-            //resultBuffer.GetData(output.ToArray());
-            resultBuffer.GetData(output);
+            ResultBuffer.GetData(FieldArray);
 
-            fixed (void* outptr = output)
+            fixed (void* outptr = FieldArray)
             {
-                //var outputdata = NativeArrayUnsafeUtility.ConvertExistingDataToNativeArray<float4>(outptr, numParticles, Allocator.TempJob);
-                var outputdata = new NativeArray<float4>(output, Allocator.TempJob);
+                //TODO: Can avoid copy with NativeArrayUnsafeUtility.ConvertExistingDataToNativeArray ?
+                var outputdata = new NativeArray<GPUGravityField>(FieldArray, Allocator.TempJob);
 
                 // Debug Log to see we got it
-                //Debug.Log("My output Data" + myoutput[0].ToString() + myoutput[1].ToString() + myoutput[2].ToString());
-                Debug.Log("output Data" + output[0].ToString() + output[1].ToString() + output[2].ToString());
+                //Debug.Log("Output Data" + FieldArray[0].ToString() + FieldArray[1].ToString() + FieldArray[2].ToString());
 
                 // Let us hope to god Complete() hides a yield, and that unity does a good thing when we schedule like this
                 // GetData *needs* a system array, cannot deal with native array
@@ -514,8 +561,9 @@ public class GravityFieldSystem : SystemBase, IPhysicsSystem
                         int entityInQueryIndex,
                         ref GravityField gravity_i
                         ) => 
-                    { 
-                        gravity_i.Value = outputdata[entityInQueryIndex];
+                    {
+                        GPUGravityField gpu_grav = outputdata[entityInQueryIndex];
+                        gravity_i.Value = new float4(gpu_grav.FieldVector, /*gpu_grav.Phi*/ 0);
                     }).Schedule(default);
 
                 copyDataHandle.Complete();

@@ -27,7 +27,7 @@ public class VelocitySystem : SystemBase
         //
         // Gravity system blocks the main thread while this happens
         var gravityFieldSystem = World.GetExistingSystem<GravityFieldSystem>();
-        //gravityFieldSystem.EnsureFieldComputationComplete();
+        gravityFieldSystem.EnsureFieldComputationComplete();
 
         // Need to get dt for velocity updates
         var dt = World.Time.DeltaTime;

@@ -15,9 +15,29 @@ using Unity.Transforms;
 [UpdateAfter(typeof(ExportPhysicsWorld))]
 public class ParticleSmoothingSystem : SystemBase
 {
+    public enum SmoothingImpl: ushort
+    {
+        SMOOTHING_CONSTANT,
+        SMOOTHING_NEIGHBOR_TARGET,
+    }
+    public const SmoothingImpl k_SmoothingImpl = SmoothingImpl.SMOOTHING_CONSTANT;
+
     public const float TARGET_NEIGHBORS = 50;
+
     protected override void OnUpdate()
     {
+        switch(k_SmoothingImpl)
+        {
+            case SmoothingImpl.SMOOTHING_CONSTANT:
+                break;
+            case SmoothingImpl.SMOOTHING_NEIGHBOR_TARGET:
+                OnUpdateNeighborTarget();
+                break;
+        }
+    }
+    private void OnUpdateNeighborTarget()
+    {
+
         Entities.ForEach((
             int entityInQueryIndex, Entity i,
             ref ParticleSmoothing smoothing_i,
